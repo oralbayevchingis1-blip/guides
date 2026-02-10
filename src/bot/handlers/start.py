@@ -46,24 +46,61 @@ async def cmd_start(
     if user is None:
         return
 
-    # Парсим deep-link параметр (источник трафика)
-    source = command.args or ""
-    if source:
-        logger.info("Deep-link source: '%s' от user_id=%s", source, user.id)
+    # Парсим deep-link параметр (UTM / partner / referral)
+    from src.bot.utils.growth_engine import parse_utm_source
+
+    raw_source = command.args or ""
+    utm = parse_utm_source(raw_source)
+    source = utm.get("source", raw_source)
+    partner_id = utm.get("partner_id", "")
+
+    if raw_source:
+        logger.info(
+            "Deep-link: '%s' → type=%s, source=%s, partner=%s (user_id=%s)",
+            raw_source, utm["type"], source, partner_id, user.id,
+        )
 
     # Сохраняем пользователя в БД (SQLite backup)
-    await get_or_create_user(
+    db_user = await get_or_create_user(
         user_id=user.id,
         username=user.username,
         full_name=user.full_name,
     )
 
+    # Сохраняем partner_id и source если пришёл от партнёра
+    if partner_id or utm["type"] != "direct":
+        try:
+            from src.database.models import async_session as _asession
+            async with _asession() as session:
+                from sqlalchemy import select
+                from src.database.models import User as UserModel
+                stmt = select(UserModel).where(UserModel.user_id == user.id)
+                result = await session.execute(stmt)
+                u = result.scalar_one_or_none()
+                if u:
+                    if partner_id and not u.partner_id:
+                        u.partner_id = partner_id
+                    if source and not u.traffic_source:
+                        u.traffic_source = source
+                    await session.commit()
+        except Exception:
+            pass
+
     logger.info("Команда /start от user_id=%s", user.id)
 
+    # P5: Телеметрия
+    try:
+        from src.bot.utils.telemetry import track_event
+        asyncio.create_task(track_event(user.id, "bot_started", {
+            "source": source, "type": utm["type"],
+        }))
+    except Exception:
+        pass
+
     # Обработка реферальной ссылки (ref_{user_id})
-    if source.startswith("ref_"):
+    if utm["type"] == "referral":
         try:
-            referrer_id = int(source.removeprefix("ref_"))
+            referrer_id = int(utm.get("referrer_id", "0"))
             was_saved = await save_referral(
                 referrer_id=referrer_id,
                 referred_id=user.id,
@@ -86,9 +123,20 @@ async def cmd_start(
     # Сброс состояния FSM (на случай повторного /start)
     await state.clear()
 
-    # Сохраняем source в FSM state для использования при записи лида
+    # Сохраняем source + partner в FSM state для записи лида
     if source:
-        await state.update_data(traffic_source=source)
+        await state.update_data(
+            traffic_source=source,
+            partner_id=partner_id,
+            utm_type=utm["type"],
+            utm_campaign=utm.get("campaign", ""),
+        )
+
+    # Автодетекция языка по Telegram language_code
+    from src.bot.utils.i18n import get_user_lang, set_user_lang
+    tg_lang = user.language_code or ""
+    user_lang = get_user_lang(user.id, tg_lang)
+    set_user_lang(user.id, user_lang)
 
     # Загружаем тексты и каталог из Google Sheets (с кешем)
     texts = await cache.get_or_fetch("texts", google.get_bot_texts)

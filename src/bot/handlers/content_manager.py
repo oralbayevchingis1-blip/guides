@@ -99,7 +99,7 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await message.answer(
-        "🏠 *Панель управления SOLIS Bot*\n\n"
+        "🏠 <b>Панель управления SOLIS Bot</b>\n\n"
         "Выберите раздел:",
         reply_markup=_main_menu_keyboard(),
     )
@@ -111,7 +111,7 @@ async def go_home(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()
     await callback.message.edit_text(
-        "🏠 *Панель управления SOLIS Bot*\n\nВыберите раздел:",
+        "🏠 <b>Панель управления SOLIS Bot</b>\n\nВыберите раздел:",
         reply_markup=_main_menu_keyboard(),
     )
     await callback.answer()
@@ -138,7 +138,7 @@ async def menu_content(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(
-        "📝 *Управление контентом*\n\nВыберите действие:",
+        "📝 <b>Управление контентом</b>\n\nВыберите действие:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="📝 Опубликовать статью", callback_data="cm_publish")],
@@ -176,7 +176,7 @@ async def articles_list(
         )
         return
 
-    text = "📋 *Статьи на сайте:*\n\n"
+    text = "📋 <b>Статьи на сайте:</b>\n\n"
     buttons = []
     for art in reversed(articles[-10:]):
         title = art.get("title", art.get("id", "?"))[:40]
@@ -271,14 +271,14 @@ async def start_publish(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(ArticleForm.waiting_text)
     await callback.message.edit_text(
-        "📝 *Публикация статьи на сайт*\n\n"
+        "📝 <b>Публикация статьи на сайт</b>\n\n"
         "Просто скиньте текст статьи целиком.\n"
         "AI автоматически:\n"
         "• Определит заголовок\n"
         "• Подберёт категорию\n"
         "• Напишет описание для превью\n"
         "• Сделает HTML-разметку\n\n"
-        "Также можно отправить *ссылку* (URL) — она будет опубликована как внешняя статья.",
+        "Также можно отправить <b>ссылку</b> (URL) — она будет опубликована как внешняя статья.",
     )
     await callback.answer()
 
@@ -290,7 +290,7 @@ async def cmd_publish(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(ArticleForm.waiting_text)
     await message.answer(
-        "📝 *Публикация статьи*\n\n"
+        "📝 <b>Публикация статьи</b>\n\n"
         "Скиньте текст статьи — AI сам всё разметит.\n"
         "Или отправьте ссылку (URL) для внешней статьи.",
     )
@@ -324,25 +324,37 @@ def _article_preview_keyboard(data: dict) -> InlineKeyboardMarkup:
                 callback_data="cm_telegraph",
             ),
         ],
+        # Новые визуальные функции
+        [
+            InlineKeyboardButton(
+                text="🎨 Обложка (DALL-E)" + (" ✓" if data.get("cover_image_url") else ""),
+                callback_data="cm_gen_cover",
+            ),
+        ],
+        [
+            InlineKeyboardButton(text="👁 Предпросмотр", callback_data="cm_preview_post"),
+            InlineKeyboardButton(text="🔍 Аудит красоты", callback_data="cm_beauty_audit"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _format_preview(data: dict) -> str:
-    """Формирует текст превью статьи."""
+    """Формирует текст превью статьи (HTML)."""
     content_plain = re.sub(r"<[^>]+>", "", data.get("content", ""))[:200]
     gold = " ⭐" if data.get("isGoldTag") else ""
-    cta = f"\n🔗 CTA: `{data.get('telegramBotLink', '')[:40]}...`" if data.get("telegramBotLink") else ""
+    cta = f"\n🔗 CTA: <code>{data.get('telegramBotLink', '')[:40]}...</code>" if data.get("telegramBotLink") else ""
     tg_url = data.get("telegraph_url", "")
     telegraph = f"\n📱 Telegraph: {tg_url}" if tg_url else ""
+    cover = "\n🎨 Обложка: ✅" if data.get("cover_image_url") else ""
 
     return (
-        "📋 *AI подготовил статью:*\n\n"
-        f"📌 *{data.get('title', '')}*{gold}\n"
+        "📋 <b>AI подготовил статью:</b>\n\n"
+        f"📌 <b>{data.get('title', '')}</b>{gold}\n"
         f"📂 {data.get('categoryRu', '')}\n"
         f"📄 {data.get('description', '')}\n"
-        f"{cta}{telegraph}\n\n"
-        f"✍️ _{content_plain}..._\n\n"
+        f"{cta}{telegraph}{cover}\n\n"
+        f"✍️ <i>{content_plain}...</i>\n\n"
         "Что делаем?"
     )
 
@@ -382,7 +394,7 @@ async def article_first_text(message: Message, state: FSMContext) -> None:
             externalUrl=raw_text, content="", title="", description="",
             category="News", categoryRu="Новости",
         )
-        await message.answer("🔗 Это ссылка. Отправьте *заголовок* для этой статьи:")
+        await message.answer("🔗 Это ссылка. Отправьте заголовок для этой статьи:")
         await state.set_state(ArticleForm.confirm)
         await state.update_data(_need_url_title=True)
         return
@@ -394,8 +406,8 @@ async def article_first_text(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Получил текст ({len(raw_text)} симв.)\n\n"
         "Если Telegram разделил сообщение на части — "
-        "*отправьте остальные*.\n"
-        "Когда весь текст отправлен — нажмите *«Обработать»*.",
+        "<b>отправьте остальные</b>.\n"
+        "Когда весь текст отправлен — нажмите <b>«Обработать»</b>.",
         reply_markup=_collecting_keyboard(1, len(raw_text)),
     )
 
@@ -422,7 +434,7 @@ async def article_more_text(message: Message, state: FSMContext) -> None:
     total = sum(len(p) for p in parts)
     await message.answer(
         f"✅ Часть {len(parts)} получена (всего {total} симв.)\n"
-        "Продолжайте или нажмите *«Обработать»*.",
+        "Продолжайте или нажмите <b>«Обработать»</b>.",
         reply_markup=_collecting_keyboard(len(parts), total),
     )
 
@@ -488,6 +500,10 @@ async def _do_ai_article_processing(
         description = parsed.get("description", "").strip()
         content = parsed.get("content", "").strip()
 
+        # HTML-санитайзер: очистка и исправление тегов
+        from src.bot.utils.html_sanitizer import sanitize_and_fix, unique_slug
+        content = sanitize_and_fix(content)
+
         valid_cats = {c[0] for c in CATEGORIES}
         if category not in valid_cats:
             category = "Guide"
@@ -495,9 +511,13 @@ async def _do_ai_article_processing(
         if not category_ru:
             category_ru = dict(CATEGORIES).get(category, category)
 
+        # Генерация уникального slug
+        existing_slugs: list[str] = []
+        article_slug = await unique_slug(title, existing_slugs)
+
         article_data = {
             "title": title,
-            "article_id": _slugify(title),
+            "article_id": article_slug,
             "category": category,
             "categoryRu": category_ru,
             "description": description,
@@ -540,7 +560,7 @@ async def _do_ai_article_processing(
 
         await thinking_msg.edit_text(
             f"⚠️ AI не смог — базовое форматирование.\n\n"
-            f"📌 *{first_line}*\n📂 Гайд для бизнеса\n\nОпубликовать?",
+            f"📌 <b>{first_line}</b>\n📂 Гайд для бизнеса\n\nОпубликовать?",
             reply_markup=_article_preview_keyboard(article_data),
         )
         await state.set_state(ArticleForm.confirm)
@@ -556,7 +576,7 @@ async def edit_title(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(ArticleForm.editing_field)
     await state.update_data(_editing="title")
-    await callback.message.answer("✏️ Введите новый *заголовок*:")
+    await callback.message.answer("✏️ Введите новый заголовок:")
 
 
 @router.callback_query(F.data == "cm_edit_category", ArticleForm.confirm)
@@ -599,7 +619,7 @@ async def edit_desc(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(ArticleForm.editing_field)
     await state.update_data(_editing="description")
-    await callback.message.answer("✏️ Введите новое *описание* (для превью):")
+    await callback.message.answer("✏️ Введите новое описание (для превью):")
 
 
 @router.message(ArticleForm.editing_field)
@@ -657,7 +677,7 @@ async def article_url_title(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
 
     await message.answer(
-        f"📋 *Внешняя статья:*\n\n📌 *{title}*\n🔗 {data.get('externalUrl', '')}\n\nОпубликовать?",
+        f"📋 <b>Внешняя статья:</b>\n\n📌 <b>{title}</b>\n🔗 {data.get('externalUrl', '')}\n\nОпубликовать?",
         reply_markup=_article_preview_keyboard(data),
     )
 
@@ -702,7 +722,7 @@ async def article_add_botlink(
     buttons.append([InlineKeyboardButton(text="⬅️ Назад к превью", callback_data="cm_skip_botlink")])
 
     await callback.message.answer(
-        "📥 *Привязать гайд к статье*\n\n"
+        "📥 <b>Привязать гайд к статье</b>\n\n"
         "Выберите гайд — в конце статьи появится CTA:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
@@ -768,7 +788,7 @@ async def publish_telegraph(callback: CallbackQuery, state: FSMContext) -> None:
         data = await state.get_data()
 
         await status_msg.edit_text(
-            f"✅ *Статья в Telegraph!*\n\n"
+            f"✅ <b>Статья в Telegraph!</b>\n\n"
             f"📱 {url}\n\n"
             "Эта ссылка даёт Instant View — читатели смогут "
             "читать статью прямо внутри Telegram."
@@ -786,6 +806,183 @@ async def publish_telegraph(callback: CallbackQuery, state: FSMContext) -> None:
     except Exception as e:
         logger.error("Telegraph publish error: %s", e)
         await status_msg.edit_text(f"❌ Ошибка Telegraph: {e}")
+
+
+# ── Генерация обложки (DALL-E 3) ──
+
+
+@router.callback_query(F.data == "cm_gen_cover", ArticleForm.confirm)
+async def generate_cover(callback: CallbackQuery, state: FSMContext) -> None:
+    """Генерирует AI-обложку через DALL-E 3."""
+    if not _is_admin(callback.from_user.id):
+        return
+
+    data = await state.get_data()
+    if data.get("cover_image_url"):
+        await callback.answer("Обложка уже сгенерирована!")
+        return
+
+    await callback.answer("🎨 Генерирую обложку через DALL-E 3...")
+    status_msg = await callback.message.answer("🎨 AI создаёт обложку в стиле SOLIS Partners...")
+
+    try:
+        from src.bot.utils.ai_client import generate_post_image
+
+        title = data.get("title", "Legal article")
+        image_url = await generate_post_image(title)
+
+        if image_url:
+            await state.update_data(cover_image_url=image_url)
+            data = await state.get_data()
+
+            # Отправляем превью обложки
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            await callback.message.answer_photo(
+                photo=image_url,
+                caption="🎨 <b>Обложка сгенерирована!</b>\n\n"
+                "Она будет использована в Telegraph и посте в канал.",
+            )
+
+            # Обновляем главное превью
+            try:
+                await callback.message.edit_text(
+                    _format_preview(data),
+                    reply_markup=_article_preview_keyboard(data),
+                )
+            except Exception:
+                pass
+        else:
+            await status_msg.edit_text("⚠️ Не удалось сгенерировать обложку. Попробуйте позже.")
+
+    except Exception as e:
+        logger.error("Cover generation error: %s", e)
+        await status_msg.edit_text(f"❌ Ошибка: {e}")
+
+
+# ── Предпросмотр поста (как увидят подписчики) ──
+
+
+@router.callback_query(F.data == "cm_preview_post", ArticleForm.confirm)
+async def preview_post(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отправляет превью поста так, как его увидят подписчики канала."""
+    if not _is_admin(callback.from_user.id):
+        return
+    await callback.answer()
+
+    data = await state.get_data()
+    title = data.get("title", "")
+    description = data.get("description", "")
+    category_ru = data.get("categoryRu", "")
+    cover_url = data.get("cover_image_url", "")
+    telegraph_url = data.get("telegraph_url", "")
+
+    # Формируем пост, максимально похожий на финальный
+    preview_text = (
+        f"<b>🔥 {title}</b>\n\n"
+        "───────────────\n"
+        f"📌 <b>Суть:</b> {description}\n\n"
+        f"📂 <i>{category_ru}</i>\n\n"
+    )
+
+    if telegraph_url:
+        preview_text += f'👉 <a href="{telegraph_url}">Читать статью (Instant View)</a>\n'
+    else:
+        preview_text += "👉 <a href=\"https://www.solispartners.kz/articles\">Читать на сайте</a>\n"
+
+    preview_text += (
+        "\n───────────────\n"
+        "⚖️ <b>SOLIS Partners</b> — ваш юридический партнёр"
+    )
+
+    # Если есть обложка — отправляем фото с подписью
+    if cover_url:
+        try:
+            await callback.message.answer_photo(
+                photo=cover_url,
+                caption=preview_text,
+            )
+        except Exception:
+            await callback.message.answer(preview_text)
+    else:
+        await callback.message.answer(preview_text)
+
+    await callback.message.answer(
+        "👆 <i>Так будет выглядеть пост для подписчиков.</i>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ К редактированию", callback_data="cm_back_to_edit")],
+            ]
+        ),
+    )
+
+
+# ── Аудит красоты (AI проверка оформления) ──
+
+
+@router.callback_query(F.data == "cm_beauty_audit", ArticleForm.confirm)
+async def beauty_audit(callback: CallbackQuery, state: FSMContext) -> None:
+    """AI проверяет визуальное качество текста."""
+    if not _is_admin(callback.from_user.id):
+        return
+    await callback.answer("🔍 Запускаю аудит...")
+
+    data = await state.get_data()
+    content = data.get("content", "")[:2000]
+
+    try:
+        from src.bot.utils.ai_client import audit_post_beauty
+
+        result = await audit_post_beauty(content)
+
+        score = result.get("score", 0)
+        passed = result.get("passed", True)
+        issues = result.get("issues", [])
+        suggestion = result.get("suggestion", "")
+
+        # Визуализация оценки
+        from src.bot.utils.visual import progress_bar
+
+        status = "✅ ПРОШЁЛ" if passed else "⚠️ НУЖНА ДОРАБОТКА"
+        score_bar = progress_bar(score, 50, label="Качество")
+
+        text = (
+            f"🔍 <b>Аудит визуального качества</b>\n\n"
+            f"Статус: <b>{status}</b>\n"
+            f"<code>{score_bar}</code>\n\n"
+        )
+
+        if issues:
+            text += "📋 <b>Замечания:</b>\n"
+            for issue in issues[:5]:
+                text += f"  ⚠️ {issue}\n"
+            text += "\n"
+
+        if suggestion:
+            text += f"💡 <b>Рекомендация:</b>\n<i>{suggestion}</i>"
+
+        await callback.message.answer(text)
+
+    except Exception as e:
+        logger.error("Beauty audit error: %s", e)
+        await callback.message.answer(f"❌ Ошибка аудита: {e}")
+
+
+# ── Возврат к редактированию из превью ──
+
+
+@router.callback_query(F.data == "cm_back_to_edit", ArticleForm.confirm)
+async def back_to_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    await callback.answer()
+    data = await state.get_data()
+    await callback.message.answer(
+        _format_preview(data),
+        reply_markup=_article_preview_keyboard(data),
+    )
 
 
 @router.callback_query(F.data == "cm_article_confirm", ArticleForm.confirm)
@@ -822,14 +1019,25 @@ async def article_confirm(
             telegram_bot_link=data.get("telegramBotLink", ""),
         )
 
-        # Telegraph — автопубликация, если ещё не опубликовано
+        # Telegraph — автопубликация с AI-обложкой
         telegraph_url = data.get("telegraph_url", "")
+        cover_url = data.get("cover_image_url", "")
         if not telegraph_url and data.get("content"):
             try:
+                # Генерируем обложку через DALL-E
+                if not cover_url:
+                    try:
+                        from src.bot.utils.ai_client import generate_post_image
+                        cover_url = await generate_post_image(data.get("title", ""))
+                    except Exception as img_e:
+                        logger.warning("Cover generation failed: %s", img_e)
+                        cover_url = ""
+
                 from src.bot.utils.telegraph_client import publish_to_telegraph
                 telegraph_url = await publish_to_telegraph(
                     title=data.get("title", ""),
                     html_content=data.get("content", ""),
+                    cover_image_url=cover_url or "",
                 )
             except Exception as te:
                 logger.warning("Telegraph auto-publish failed: %s", te)
@@ -841,7 +1049,7 @@ async def article_confirm(
 
         if success:
             await status_msg.edit_text(
-                f"✅ *Статья опубликована!*\n\n📝 {data.get('title', '')}{tg_line}\n\n"
+                f"✅ <b>Статья опубликована!</b>\n\n📝 {data.get('title', '')}{tg_line}\n\n"
                 "Сайт обновится через 1-2 мин (Vercel deploy).",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
@@ -852,7 +1060,7 @@ async def article_confirm(
             )
         else:
             await status_msg.edit_text(
-                f"⚠️ Статья сохранена, но синк не удался.{tg_line}\n`python sync_articles.py`",
+                f"⚠️ Статья сохранена, но синк не удался.{tg_line}\n<code>python sync_articles.py</code>",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text="🔄 Повторить", callback_data="cm_sync")],
@@ -910,12 +1118,23 @@ async def article_and_channel(
         asyncio.create_task(_run_site_sync())
 
         telegraph_url = data.get("telegraph_url", "")
+        cover_url = data.get("cover_image_url", "")
         if not telegraph_url and data.get("content"):
             try:
+                # Генерируем обложку через DALL-E
+                if not cover_url:
+                    try:
+                        from src.bot.utils.ai_client import generate_post_image
+                        cover_url = await generate_post_image(data.get("title", ""))
+                    except Exception as img_e:
+                        logger.warning("Cover generation failed: %s", img_e)
+                        cover_url = ""
+
                 from src.bot.utils.telegraph_client import publish_to_telegraph
                 telegraph_url = await publish_to_telegraph(
                     title=data.get("title", ""),
                     html_content=data.get("content", ""),
+                    cover_image_url=cover_url or "",
                 )
             except Exception as te:
                 logger.warning("Telegraph auto-publish failed: %s", te)
@@ -950,7 +1169,7 @@ async def article_and_channel(
         # Показываем превью поста
         await status_msg.edit_text(
             f"✅ Статья опубликована!\n\n"
-            f"📢 *Пост для канала:*\n\n{channel_post}",
+            f"📢 <b>Пост для канала:</b>\n\n{channel_post}",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="📢 Опубликовать в канал", callback_data="cm_send_channel")],
@@ -981,7 +1200,7 @@ async def menu_guides(callback: CallbackQuery, google: GoogleSheetsClient, cache
     count = len(catalog) if catalog else 0
 
     await callback.message.edit_text(
-        f"📚 *Управление гайдами*\n\n📊 В каталоге: *{count}* гайдов\n\nВыберите действие:",
+        f"📚 <b>Управление гайдами</b>\n\n📊 В каталоге: <b>{count}</b> гайдов\n\nВыберите действие:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="📤 Загрузить гайд (PDF)", callback_data="cm_upload_guide")],
@@ -1016,12 +1235,12 @@ async def guides_list(
         )
         return
 
-    text = "📚 *Каталог гайдов:*\n\n"
+    text = "📚 <b>Каталог гайдов:</b>\n\n"
     buttons = []
     for g in catalog:
         gid = g.get("id", "?")
         title = g.get("title", gid)[:35]
-        text += f"📄 *{title}*\n   🆔 `{gid}`\n\n"
+        text += f"📄 <b>{title}</b>\n   🆔 <code>{gid}</code>\n\n"
 
         cb = f"adm_gdel_{gid}"
         if len(cb.encode("utf-8")) > 64:
@@ -1071,8 +1290,8 @@ async def start_upload_guide(callback: CallbackQuery, state: FSMContext) -> None
     await state.clear()
     await state.set_state(GuideForm.waiting_pdf)
     await callback.message.edit_text(
-        "📄 *Загрузка гайда*\n\n"
-        "Отправьте *PDF-файл* — AI определит название и предложит описание.",
+        "📄 <b>Загрузка гайда</b>\n\n"
+        "Отправьте PDF-файл — AI определит название и предложит описание.",
     )
     await callback.answer()
 
@@ -1083,7 +1302,7 @@ async def cmd_upload_guide(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await state.set_state(GuideForm.waiting_pdf)
-    await message.answer("📄 Отправьте *PDF-файл* гайда:")
+    await message.answer("📄 Отправьте PDF-файл гайда:")
 
 
 @router.message(GuideForm.waiting_pdf)
@@ -1150,12 +1369,12 @@ async def guide_pdf(message: Message, state: FSMContext, bot: Bot) -> None:
 
     # Показываем превью с AI-предложением
     text = (
-        f"✅ Файл получен: `{file_name}`\n\n"
+        f"✅ Файл получен: <code>{file_name}</code>\n\n"
         f"📝 AI предлагает:\n"
-        f"*Название:* {suggested_title}\n"
+        f"<b>Название:</b> {suggested_title}\n"
     )
     if suggested_desc:
-        text += f"*Описание:* {suggested_desc}\n"
+        text += f"<b>Описание:</b> {suggested_desc}\n"
 
     text += "\nЧто делаем?"
 
@@ -1179,7 +1398,7 @@ async def guide_edit_title(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await callback.answer()
     await state.set_state(GuideForm.waiting_title)
-    await callback.message.answer("✏️ Введите *название* гайда:")
+    await callback.message.answer("✏️ Введите название гайда:")
 
 
 @router.message(GuideForm.waiting_title)
@@ -1197,7 +1416,7 @@ async def guide_title(message: Message, state: FSMContext) -> None:
     await state.set_state(GuideForm.confirm)
     data = await state.get_data()
     await message.answer(
-        f"📝 *{title}*\n📖 {data.get('guide_description', '(нет описания)')}\n\nЗагрузить?",
+        f"📝 <b>{title}</b>\n📖 {data.get('guide_description', '(нет описания)')}\n\nЗагрузить?",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✅ Загрузить", callback_data="cm_guide_confirm")],
@@ -1214,7 +1433,7 @@ async def guide_edit_desc(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await callback.answer()
     await state.set_state(GuideForm.waiting_description)
-    await callback.message.answer("✏️ Введите *описание* гайда (1-2 предложения):")
+    await callback.message.answer("✏️ Введите описание гайда (1-2 предложения):")
 
 
 @router.message(GuideForm.waiting_description)
@@ -1232,7 +1451,7 @@ async def guide_description(message: Message, state: FSMContext) -> None:
     await state.set_state(GuideForm.confirm)
     data = await state.get_data()
     await message.answer(
-        f"📝 *{data.get('guide_title', '')}*\n📖 {desc}\n\nЗагрузить?",
+        f"📝 <b>{data.get('guide_title', '')}</b>\n📖 {desc}\n\nЗагрузить?",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✅ Загрузить", callback_data="cm_guide_confirm")],
@@ -1293,7 +1512,7 @@ async def guide_confirm(
         cache.invalidate()
 
         await status_msg.edit_text(
-            f"✅ *Гайд загружен!*\n\n📄 {title}\n🆔 `{guide_id}`\n\n"
+            f"✅ <b>Гайд загружен!</b>\n\n📄 {title}\n🆔 <code>{guide_id}</code>\n\n"
             "Гайд сразу доступен в боте.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -1322,7 +1541,7 @@ async def menu_marketing(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(
-        "📢 *Маркетинг*\n\nВыберите действие:",
+        "📢 <b>Маркетинг</b>\n\nВыберите действие:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="📢 Пост в канал", callback_data="adm_channel_post")],
@@ -1345,10 +1564,10 @@ async def start_channel_post(callback: CallbackQuery, state: FSMContext) -> None
     await state.clear()
     await state.set_state(ChannelPostForm.writing)
     await callback.message.edit_text(
-        "📢 *Пост в канал*\n\n"
+        "📢 <b>Пост в канал</b>\n\n"
         "Варианты:\n"
-        "• Отправьте *готовый текст* поста\n"
-        "• Или опишите *тему* — AI сгенерирует пост\n\n"
+        "• Отправьте готовый текст поста\n"
+        "• Или опишите тему — AI сгенерирует пост\n\n"
         "Канал: @SOLISlegal",
     )
     await callback.answer()
@@ -1388,7 +1607,7 @@ async def channel_post_text(message: Message, state: FSMContext, bot: Bot) -> No
     await state.set_state(ChannelPostForm.confirm)
 
     await message.answer(
-        f"📢 *Превью поста:*\n\n{post_text}",
+        f"📢 <b>Превью поста:</b>\n\n{post_text}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="📢 Отправить в канал", callback_data="cm_send_channel")],
@@ -1412,13 +1631,25 @@ async def send_channel_post(callback: CallbackQuery, state: FSMContext, bot: Bot
     await callback.answer()
     try:
         channel = settings.CHANNEL_USERNAME
-        await bot.send_message(
-            chat_id=channel,
-            text=post_text,
-        )
+        cover_url = data.get("cover_image_url", "")
+
+        # Если есть обложка — отправляем фото с подписью
+        if cover_url:
+            try:
+                await bot.send_photo(
+                    chat_id=channel,
+                    photo=cover_url,
+                    caption=post_text,
+                )
+            except Exception:
+                # Fallback: текст без обложки
+                await bot.send_message(chat_id=channel, text=post_text)
+        else:
+            await bot.send_message(chat_id=channel, text=post_text)
+
         await state.clear()
         await callback.message.edit_text(
-            "✅ *Пост опубликован в канал!*",
+            "✅ <b>Пост опубликован в канал!</b>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="📢 Ещё пост", callback_data="adm_channel_post")],
@@ -1454,7 +1685,7 @@ async def content_calendar(
 
     calendar = await google.get_content_calendar()
 
-    text = "📅 *Контент-календарь:*\n\n"
+    text = "📅 <b>Контент-календарь:</b>\n\n"
     if not calendar:
         text += "(пусто — AI будет предлагать идеи в дайджестах)"
     else:
@@ -1490,7 +1721,7 @@ async def menu_ai(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(
-        "🧠 *AI Ассистент*\n\nВыберите режим:",
+        "🧠 <b>AI Ассистент</b>\n\nВыберите режим:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="💬 Чат с AI-стратегом", callback_data="adm_ai_chat")],
@@ -1537,7 +1768,7 @@ async def ai_news(callback: CallbackQuery, google: GoogleSheetsClient) -> None:
             )
             return
 
-        text = "📰 *Свежие новости:*\n\n"
+        text = "📰 <b>Свежие новости:</b>\n\n"
         for i, item in enumerate(news[:8], 1):
             title = item.get("title", "?")[:60]
             source = item.get("source", "?")
@@ -1597,7 +1828,7 @@ async def ai_analyze_news(callback: CallbackQuery, google: GoogleSheetsClient) -
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm_ai")],
             ]
         )
-        text = f"🤖 *AI-анализ новостей:*\n\n{response}"
+        text = f"🤖 <b>AI-анализ новостей:</b>\n\n{response}"
         try:
             await callback.message.answer(text, reply_markup=kb)
         except Exception:
@@ -1621,7 +1852,7 @@ async def auto_faq(callback: CallbackQuery, google: GoogleSheetsClient) -> None:
 
         if not consult_log:
             await callback.message.edit_text(
-                "❓ *Auto-FAQ*\n\nПока нет данных. Вопросы из /consult будут накапливаться, "
+                "❓ <b>Auto-FAQ</b>\n\nПока нет данных. Вопросы из /consult будут накапливаться, "
                 "и AI определит популярные темы.",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm_ai")]],
@@ -1654,7 +1885,7 @@ async def auto_faq(callback: CallbackQuery, google: GoogleSheetsClient) -> None:
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm_ai")],
             ]
         )
-        text = f"❓ *Auto-FAQ — популярные темы:*\n\n{response}"
+        text = f"❓ <b>Auto-FAQ — популярные темы:</b>\n\n{response}"
         try:
             await callback.message.edit_text(text, reply_markup=kb)
         except Exception:
@@ -1678,7 +1909,7 @@ async def data_room_menu(callback: CallbackQuery, google: GoogleSheetsClient) ->
     await callback.answer()
 
     data = await google.get_data_room()
-    text = "🗂 *Data Room — знания о компании*\n\n"
+    text = "🗂 <b>Data Room — знания о компании</b>\n\n"
     if not data:
         text += "(пусто — добавьте информацию о компании для AI-контекста)"
     else:
@@ -1711,12 +1942,12 @@ async def data_room_add(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(DataRoomForm.adding)
     await callback.message.answer(
-        "➕ *Добавить в Data Room*\n\n"
+        "➕ <b>Добавить в Data Room</b>\n\n"
         "Формат:\n"
-        "`Категория | Заголовок | Описание`\n\n"
+        "<code>Категория | Заголовок | Описание</code>\n\n"
         "Категории: Услуги, Кейсы, Команда, КП, Процессы, Прочее\n\n"
         "Пример:\n"
-        "`Услуги | ESOP для стартапов | Разрабатываем опционные программы...`"
+        "<code>Услуги | ESOP для стартапов | Разрабатываем опционные программы...</code>"
     )
 
 
@@ -1734,7 +1965,7 @@ async def data_room_save(
         return
     parts = text.split("|")
     if len(parts) < 2:
-        await message.answer("Используйте формат: `Категория | Заголовок | Описание`")
+        await message.answer("Используйте формат: <code>Категория | Заголовок | Описание</code>")
         return
 
     category = parts[0].strip()
@@ -1807,28 +2038,28 @@ async def menu_analytics(
     top_sources = sorted(source_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
     text = (
-        "📊 *Аналитика SOLIS Bot*\n\n"
-        f"👥 Пользователей: *{len(user_ids)}*\n"
-        f"📚 Гайдов: *{len(catalog)}*\n"
-        f"📋 Всего лидов: *{len(leads)}*\n"
-        f"🔥 Лидов сегодня: *{len(today_leads)}*\n\n"
+        "📊 <b>Аналитика SOLIS Bot</b>\n\n"
+        f"👥 Пользователей: <b>{len(user_ids)}</b>\n"
+        f"📚 Гайдов: <b>{len(catalog)}</b>\n"
+        f"📋 Всего лидов: <b>{len(leads)}</b>\n"
+        f"🔥 Лидов сегодня: <b>{len(today_leads)}</b>\n\n"
     )
 
     if top_guides:
-        text += "📚 *Топ гайдов:*\n"
+        text += "📚 <b>Топ гайдов:</b>\n"
         for g, c in top_guides:
             text += f"  • {g}: {c}\n"
         text += "\n"
 
     if top_sources:
-        text += "📍 *Источники:*\n"
+        text += "📍 <b>Источники:</b>\n"
         for s, c in top_sources:
             text += f"  • {s}: {c}\n"
         text += "\n"
 
     # Последние 3 лида
     if leads:
-        text += "👤 *Последние лиды:*\n"
+        text += "👤 <b>Последние лиды:</b>\n"
         for l in leads[-3:]:
             name = l.get("name", "?")
             email = l.get("email", "?")
@@ -1872,7 +2103,7 @@ async def menu_settings(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(
-        "⚙️ *Настройки*\n\nВыберите действие:",
+        "⚙️ <b>Настройки</b>\n\nВыберите действие:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Синхронизировать сайт", callback_data="cm_sync")],
@@ -1920,7 +2151,7 @@ async def sync_site_callback(callback: CallbackQuery) -> None:
         )
     else:
         await status_msg.edit_text(
-            "⚠️ Синхронизация не удалась.\n`python sync_articles.py`",
+            "⚠️ Синхронизация не удалась.\n<code>python sync_articles.py</code>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="adm_home")]],
             ),
@@ -1936,7 +2167,7 @@ async def cmd_site_sync(message: Message) -> None:
     if success:
         await status_msg.edit_text("✅ Сайт синхронизирован!")
     else:
-        await status_msg.edit_text("⚠️ Ошибка. `python sync_articles.py`")
+        await status_msg.edit_text("⚠️ Ошибка. <code>python sync_articles.py</code>")
 
 
 # ── Обратная совместимость: старые callback cm_stats ──

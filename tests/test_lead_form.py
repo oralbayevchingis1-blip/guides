@@ -1,11 +1,8 @@
 """Тесты валидации email и формы сбора лидов."""
 
-import re
-
 import pytest
 
-# Regex из lead_form.py
-EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+from src.bot.handlers.lead_form import EMAIL_REGEX
 
 
 class TestEmailValidation:

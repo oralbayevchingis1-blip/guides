@@ -139,6 +139,8 @@ async def publish_to_telegraph(
     title: str,
     html_content: str,
     author_name: str = "SOLIS Partners",
+    *,
+    cover_image_url: str = "",
 ) -> str:
     """Публикует статью в Telegraph. Возвращает URL.
 
@@ -146,18 +148,40 @@ async def publish_to_telegraph(
         title: Заголовок статьи (1-256 символов).
         html_content: Содержание в HTML.
         author_name: Имя автора.
+        cover_image_url: URL обложки (DALL-E или другой). Вставляется первым блоком.
 
     Returns:
         URL опубликованной страницы (telegra.ph/...).
     """
     token = await _get_or_create_token()
-    nodes = _html_to_nodes(html_content)
+
+    # Вставляем обложку как первый блок статьи
+    cover_nodes: list = []
+    if cover_image_url:
+        cover_nodes = [
+            {
+                "tag": "figure",
+                "children": [
+                    {
+                        "tag": "img",
+                        "attrs": {"src": cover_image_url},
+                    },
+                    {
+                        "tag": "figcaption",
+                        "children": [f"© SOLIS Partners — {title[:100]}"],
+                    },
+                ],
+            },
+        ]
+
+    content_nodes = _html_to_nodes(html_content)
+    all_nodes = cover_nodes + content_nodes
 
     result = await _api_call(
         "createPage",
         access_token=token,
         title=title[:256],
-        content=json.dumps(nodes, ensure_ascii=False),
+        content=json.dumps(all_nodes, ensure_ascii=False),
         author_name=author_name[:128],
         author_url="https://solispartners.kz",
         return_content="false",

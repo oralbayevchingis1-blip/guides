@@ -1,4 +1,10 @@
-"""Inline-клавиатуры бота."""
+"""Inline-клавиатуры бота — дизайн для мобильных.
+
+Принципы UX:
+- Одна кнопка на строку для важных действий (удобно нажимать большим пальцем)
+- Эмодзи в начале каждой кнопки для быстрого визуального сканирования
+- Максимум 6 кнопок на экран
+"""
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -12,13 +18,13 @@ def subscription_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Подписаться на канал",
+                    text="📢 Подписаться на канал",
                     url=f"https://t.me/{channel_name}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🔍 Проверить подписку",
+                    text="✅ Проверить подписку",
                     callback_data="check_subscription",
                 )
             ],
@@ -29,22 +35,37 @@ def subscription_keyboard() -> InlineKeyboardMarkup:
 def guides_menu_keyboard(catalog: list[dict]) -> InlineKeyboardMarkup:
     """Клавиатура выбора мини-гайда (динамическая из Google Sheets).
 
-    Args:
-        catalog: Список словарей с ключами ``id`` и ``title``
-                 (загруженный из листа «Каталог гайдов»).
+    Каждый гайд — отдельная строка с тематическим эмодзи.
     """
+    # Маппинг категорий к эмодзи
+    _GUIDE_EMOJI = {
+        "too": "📑", "ip": "🚀", "mfca": "🌍", "aifc": "🌍",
+        "esop": "💰", "tax": "💰", "labor": "⚖️", "it": "💡",
+        "ma": "💰", "m&a": "💰",
+    }
+
     buttons = []
     for guide in catalog:
         guide_id = guide.get("id", "???")
-        # Telegram лимит callback_data = 64 байта; "guide_" = 6 байт
+        title = guide.get("title", guide_id)
+
+        # Выбираем эмодзи по ID гайда
+        emoji = "📚"
+        gid_lower = guide_id.lower()
+        for key, em in _GUIDE_EMOJI.items():
+            if key in gid_lower:
+                emoji = em
+                break
+
+        # Telegram лимит callback_data = 64 байта
         cb_data = f"guide_{guide_id}"
-        # Обрезаем СТРОГО по байтам (кириллица = 2 байта/символ)
         while len(cb_data.encode("utf-8")) > 64:
             cb_data = cb_data[:-1]
+
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=guide.get("title", guide_id),
+                    text=f"{emoji} {title}",
                     callback_data=cb_data,
                 )
             ]
@@ -53,7 +74,7 @@ def guides_menu_keyboard(catalog: list[dict]) -> InlineKeyboardMarkup:
 
 
 def consent_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура согласия на обработку персональных данных."""
+    """Клавиатура согласия — две кнопки на отдельных строках."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -61,35 +82,37 @@ def consent_keyboard() -> InlineKeyboardMarkup:
                     text="✅ Даю согласие",
                     callback_data="give_consent",
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="❌ Отказаться",
                     callback_data="decline_consent",
                 ),
-            ]
+            ],
         ]
     )
 
 
 def after_guide_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура после выдачи гайда и завершения воронки.
-
-    Позволяет пользователю:
-    - Посмотреть другие гайды
-    - Задать вопрос AI-юристу
-    - Поделиться ботом (реферал)
-    """
+    """Клавиатура после выдачи гайда — одна кнопка на строку."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📚 Посмотреть другие гайды",
-                    callback_data="show_all_guides",
-                )
+                    text="🤖 Задать вопрос AI-юристу",
+                    callback_data="start_consult",
+                ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🤖 Задать вопрос юристу (AI)",
-                    callback_data="start_consult",
+                    text="📚 Посмотреть другие гайды",
+                    callback_data="show_all_guides",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔗 Поделиться ботом",
+                    callback_data="referral_share",
                 ),
             ],
         ]

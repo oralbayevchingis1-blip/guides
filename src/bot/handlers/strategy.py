@@ -53,7 +53,7 @@ async def cmd_chat(message: Message, state: FSMContext) -> None:
     await state.update_data(history=[])
 
     await message.answer(
-        "🧠 *AI-стратег SOLIS Partners*\n\n"
+        "🧠 <b>AI-стратег SOLIS Partners</b>\n\n"
         "Я — ваш маркетинговый стратег. Знаю всё о компании, "
         "слежу за новостями и аналитикой.\n\n"
         "Спрашивайте что угодно:\n"
@@ -112,9 +112,12 @@ async def strategy_conversation(
 
     try:
         from src.bot.utils.ai_client import ask_marketing
+        from src.bot.utils.rag import find_relevant_context
 
-        # Собираем контекст
-        context = await _build_strategy_context(google, cache)
+        # RAG: приоритизированный контекст по запросу + общий контекст
+        rag = await find_relevant_context(user_text, google, cache)
+        general_ctx = await _build_strategy_context(google, cache)
+        context = (rag + "\n\n" + general_ctx) if rag else general_ctx
 
         # Получаем историю диалога
         data = await state.get_data()
@@ -210,7 +213,7 @@ async def strategy_ideas(
                 [InlineKeyboardButton(text="💡 Ещё", callback_data="strat_ideas")],
             ]
         )
-        text = f"💡 *Идеи на эту неделю:*\n\n{response}"
+        text = f"💡 <b>Идеи на эту неделю:</b>\n\n{response}"
         try:
             await callback.message.answer(text, reply_markup=kb)
         except Exception:
@@ -266,7 +269,7 @@ async def strategy_weekly(
                 [InlineKeyboardButton(text="✅ Принято", callback_data="digest_ack")],
             ]
         )
-        text = f"📊 *Еженедельный анализ:*\n\n{response}"
+        text = f"📊 <b>Еженедельный анализ:</b>\n\n{response}"
         try:
             await callback.message.answer(text, reply_markup=kb)
         except Exception:

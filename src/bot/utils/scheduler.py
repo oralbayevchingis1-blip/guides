@@ -1,23 +1,34 @@
-"""APScheduler для авто-серии follow-up сообщений после скачивания гайда."""
+"""APScheduler с SQLAlchemyJobStore для persistent follow-up сообщений.
+
+Задачи не теряются при перезагрузке бота.
+"""
 
 import logging
 from datetime import datetime, timedelta, timezone
 
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.jobstores.memory import MemoryJobStore
+
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
 # Глобальный экземпляр планировщика
 _scheduler: AsyncIOScheduler | None = None
 
+# SQLAlchemyJobStore требует синхронный URL (без +aiosqlite)
+_SYNC_DB_URL = settings.DATABASE_URL.replace("+aiosqlite", "").replace("sqlite:///", "sqlite:///")
+
 
 def get_scheduler() -> AsyncIOScheduler:
-    """Возвращает (создаёт при первом вызове) планировщик."""
+    """Возвращает (создаёт при первом вызове) планировщик с persistent storage."""
     global _scheduler
     if _scheduler is None:
+        jobstores = {
+            "default": SQLAlchemyJobStore(url=_SYNC_DB_URL),
+        }
         _scheduler = AsyncIOScheduler(
-            jobstores={"default": MemoryJobStore()},
+            jobstores=jobstores,
             timezone="UTC",
         )
     return _scheduler
@@ -50,10 +61,6 @@ def schedule_followup_series(
         run_at = now + delta
         job_id = f"followup_{user_id}_{guide_id}_step{step}"
 
-        # Удаляем старый job если есть (пользователь скачал тот же гайд повторно)
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-
         scheduler.add_job(
             send_func,
             trigger="date",
@@ -67,3 +74,20 @@ def schedule_followup_series(
             "Follow-up запланирован: user_id=%s, guide=%s, step=%d, run_at=%s",
             user_id, guide_id, step, run_at.isoformat(),
         )
+
+
+def schedule_pending_sheets_retry(retry_func) -> None:
+    """Планирует повторную отправку pending writes в Google Sheets каждые 5 минут."""
+    scheduler = get_scheduler()
+    job_id = "retry_pending_sheets_writes"
+
+    if not scheduler.get_job(job_id):
+        scheduler.add_job(
+            retry_func,
+            trigger="interval",
+            minutes=5,
+            id=job_id,
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+        logger.info("Pending sheets retry scheduled every 5 min")

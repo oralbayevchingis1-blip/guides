@@ -37,6 +37,7 @@ class LeadForm(StatesGroup):
     waiting_for_email = State()
     waiting_for_name = State()
     consent_given = State()
+    waiting_for_business_sphere = State()  # P7: Прогрессивное профилирование
 
 
 # ──────────────────────── Вспомогательные ───────────────────────────────
@@ -68,6 +69,13 @@ async def process_guide_selection(
     пропускаем форму и сразу отдаём PDF + записываем скачивание.
     """
     guide_id = callback.data.removeprefix("guide_")
+
+    # P5: Телеметрия
+    try:
+        from src.bot.utils.telemetry import track_event
+        asyncio.create_task(track_event(callback.from_user.id, "guide_selected", {"guide": guide_id}))
+    except Exception:
+        pass
 
     # Загружаем каталог и тексты из кеша
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
@@ -110,34 +118,38 @@ async def process_guide_selection(
     elif file_id:
         local_path = await download_guide_pdf(file_id)
 
+    # Формируем брендированную подпись для PDF
+    from src.bot.utils.visual import guide_caption
+
+    guide_title = guide_info.get("title", guide_id)
+    guide_desc = guide_info.get("description", "")
+    branded_caption = guide_caption(
+        title=guide_title,
+        description=guide_desc,
+    )
+    # Telegram caption limit: 1024 chars
+    if len(branded_caption) > 1024:
+        branded_caption = branded_caption[:1020] + "..."
+
     if telegram_file_id:
         await callback.message.answer_document(
             document=telegram_file_id,
-            caption=add_disclaimer(
-                get_text(texts, "guide_delivered"),
-                texts,
-            ),
+            caption=branded_caption,
         )
     elif local_path:
         document = FSInputFile(local_path)
         await callback.message.answer_document(
             document=document,
-            caption=add_disclaimer(
-                get_text(texts, "guide_delivered"),
-                texts,
-            ),
+            caption=branded_caption,
         )
     else:
         # PDF не доступен — отправляем текст-заглушку
         await callback.message.answer(
-            add_disclaimer(
-                get_text(
-                    texts,
-                    "guide_pdf_unavailable",
-                    title=guide_info.get("title", guide_id),
-                    description=guide_info.get("description", ""),
-                ),
+            get_text(
                 texts,
+                "guide_pdf_unavailable",
+                title=guide_title,
+                description=guide_desc,
             ),
         )
         logger.warning(
@@ -178,6 +190,20 @@ async def process_guide_selection(
             guide_id,
         )
 
+        # ── P7: Прогрессивное профилирование ──
+        # Если у пользователя ещё нет бизнес-сферы — спрашиваем
+        if not getattr(existing_lead, "business_sphere", None):
+            await callback.message.answer(
+                f"👋 <b>{existing_lead.name}</b>, спасибо за доверие!\n\n"
+                "Чтобы мы могли подбирать для вас наиболее релевантные материалы, "
+                "подскажите — <b>в какой сфере ваш бизнес?</b>\n\n"
+                "Например: IT, строительство, ритейл, финтех, медицина, образование...\n\n"
+                "<i>Или отправьте «-» чтобы пропустить</i>",
+            )
+            await state.update_data(profiling_user_id=user_id)
+            await state.set_state(LeadForm.waiting_for_business_sphere)
+            return
+
         # Показываем кнопку "Другие гайды"
         await callback.message.answer(
             get_text(
@@ -190,9 +216,87 @@ async def process_guide_selection(
         await state.clear()
         return
 
-    # Начинаем сбор контактных данных для нового пользователя
-    await callback.message.answer(get_text(texts, "ask_email"))
+    # A/B тест текста приглашения email
+    from src.bot.utils.growth_engine import get_ab_variant
+
+    variant = get_ab_variant("email_cta", callback.from_user.id)
+    if variant == "B":
+        email_text = (
+            "📝 Оставьте email — мы пришлём:\n"
+            "• Обновления законодательства по вашей теме\n"
+            "• Приглашения на бесплатные вебинары\n\n"
+            "Укажите ваш email:"
+        )
+    else:
+        email_text = get_text(texts, "ask_email")
+
+    await callback.message.answer(email_text)
     await state.set_state(LeadForm.waiting_for_email)
+
+
+# ──────────────────── P7: Прогрессивное профилирование ─────────────────
+
+
+@router.message(LeadForm.waiting_for_business_sphere)
+async def process_business_sphere(
+    message: Message,
+    state: FSMContext,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Сохраняет бизнес-сферу пользователя (прогрессивное профилирование)."""
+    text = (message.text or "").strip()
+
+    if text.startswith("/"):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    user_id = data.get("profiling_user_id", message.from_user.id)
+
+    if text != "-" and len(text) >= 2:
+        # Сохраняем бизнес-сферу в БД
+        try:
+            from src.database.models import Lead, async_session
+            from sqlalchemy import select
+
+            async with async_session() as session:
+                stmt = (
+                    select(Lead)
+                    .where(Lead.user_id == user_id)
+                    .order_by(Lead.id.desc())
+                    .limit(1)
+                )
+                result = await session.execute(stmt)
+                lead = result.scalar_one_or_none()
+                if lead:
+                    lead.business_sphere = text[:255]
+                    await session.commit()
+                    logger.info("Business sphere saved: user=%s sphere='%s'", user_id, text[:50])
+        except Exception as e:
+            logger.error("Failed to save business sphere: %s", e)
+
+        await message.answer(
+            f"✅ Спасибо! Записали: <b>{text}</b>\n\n"
+            "Теперь мы будем подбирать для вас более релевантный контент.",
+            reply_markup=after_guide_keyboard(),
+        )
+
+        # Телеметрия
+        try:
+            from src.bot.utils.telemetry import track_event
+            asyncio.create_task(
+                track_event(user_id, "business_sphere_entered", {"sphere": text[:50]})
+            )
+        except Exception:
+            pass
+    else:
+        await message.answer(
+            "Хорошо, пропускаем. Вы всегда можете дополнить профиль позже.",
+            reply_markup=after_guide_keyboard(),
+        )
+
+    await state.clear()
 
 
 # ──────────────────────── Сбор email ────────────────────────────────────
@@ -217,8 +321,23 @@ async def process_email(
         await message.answer(get_text(texts, "invalid_email"))
         return
 
+    # P3: Pydantic-валидация (disposable email, формат)
+    from src.bot.utils.validators import validate_lead
+    is_valid, err_msg = validate_lead(name="placeholder", email=email)
+    if not is_valid and "email" in err_msg.lower():
+        await message.answer(f"⚠️ {err_msg}\n\nПопробуйте другой email.")
+        return
+
     await state.update_data(email=email)
     await message.answer(get_text(texts, "email_saved"))
+
+    # Телеметрия
+    try:
+        from src.bot.utils.telemetry import track_event
+        asyncio.create_task(track_event(message.from_user.id, "email_entered"))
+    except Exception:
+        pass
+
     await state.set_state(LeadForm.waiting_for_name)
 
 
@@ -244,7 +363,22 @@ async def process_name(
         await message.answer(get_text(texts, "invalid_name"))
         return
 
+    # P3: Pydantic-валидация имени (мусорный текст, только цифры)
+    from src.bot.utils.validators import is_garbage_text
+    if is_garbage_text(name):
+        await message.answer(
+            "Пожалуйста, введите настоящее имя (минимум 2 символа, не тестовый текст)."
+        )
+        return
+
     await state.update_data(name=name)
+
+    # Телеметрия
+    try:
+        from src.bot.utils.telemetry import track_event
+        asyncio.create_task(track_event(message.from_user.id, "name_entered"))
+    except Exception:
+        pass
 
     # Показываем согласие на обработку данных
     await message.answer(
@@ -278,6 +412,13 @@ async def process_consent(
     selected_guide = data.get("selected_guide", "")
     traffic_source = data.get("traffic_source", "")
 
+    # 0. Записываем A/B конверсию
+    try:
+        from src.bot.utils.growth_engine import record_ab_conversion
+        record_ab_conversion("email_cta", user_id)
+    except Exception:
+        pass
+
     # 1. Сохраняем лид в SQLite (надёжный backup)
     await save_lead(
         user_id=user_id,
@@ -301,6 +442,14 @@ async def process_consent(
     # 3. Логируем согласие для compliance
     await log_consent(user_id=user_id, consent_type="personal_data_processing")
 
+    # P5: Телеметрия — лид сохранён
+    try:
+        from src.bot.utils.telemetry import track_event
+        asyncio.create_task(track_event(user_id, "consent_given"))
+        asyncio.create_task(track_event(user_id, "lead_saved", {"guide": selected_guide}))
+    except Exception:
+        pass
+
     logger.info(
         "Новый лид: user_id=%s, email=%s, name=%s, guide=%s",
         user_id,
@@ -308,6 +457,13 @@ async def process_consent(
         name,
         selected_guide,
     )
+
+    # C4: Отправляем приветственный email
+    try:
+        from src.bot.utils.email_sender import send_welcome_email
+        asyncio.create_task(send_welcome_email(name, email, selected_guide))
+    except Exception:
+        pass  # non-critical
 
     # 4. Планируем follow-up серию сообщений
     if send_followup and selected_guide:
@@ -321,6 +477,27 @@ async def process_consent(
         "📚 Хотите посмотреть другие полезные материалы?",
         reply_markup=after_guide_keyboard(),
     )
+
+    # L4: Conflict Check — проверяем нового клиента на конфликт интересов
+    try:
+        from src.bot.utils.legal_search import check_conflicts
+
+        async def _conflict_check():
+            result = await check_conflicts(name=name, google=google)
+            if result.get("has_conflict"):
+                conflict_text = (
+                    f"⚠️ <b>Conflict Check Alert</b>\n\n"
+                    f"Новый лид: {name} ({email})\n"
+                    f"Риск: {result['risk_level']}\n"
+                    f"Совпадений: {len(result['matches'])}\n\n"
+                )
+                for m in result["matches"][:5]:
+                    conflict_text += f"  • {m['type']}: {m.get('name', '')} ({m['match_term']})\n"
+                await bot.send_message(settings.ADMIN_ID, conflict_text)
+
+        asyncio.create_task(_conflict_check())
+    except Exception:
+        pass  # non-critical
 
     # 6. Уведомляем администратора (с контекстом и кнопками)
     asyncio.create_task(
@@ -381,11 +558,13 @@ async def show_all_guides(
 # ──────────────────────── Вспомогательные ───────────────────────────────
 
 
-def _esc_md(text: str) -> str:
-    """Экранирует спецсимволы Markdown V1 в пользовательских данных."""
-    for ch in ("_", "*", "`", "["):
-        text = text.replace(ch, f"\\{ch}")
-    return text
+def _esc_html(text: str) -> str:
+    """Экранирует спецсимволы HTML в пользовательских данных."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 async def notify_admin(
@@ -400,17 +579,17 @@ async def notify_admin(
 ) -> None:
     """Отправка уведомления администратору о новом лиде с контекстом и кнопками."""
     try:
-        source_line = f"📍 Источник: {_esc_md(source)}\n" if source else ""
+        source_line = f"📍 Источник: {_esc_html(source)}\n" if source else ""
         username_display = f"@{username}" if username else "нет"
 
         text = (
-            "🆕 *Новый лид!*\n\n"
-            f"👤 Имя: {_esc_md(name)}\n"
-            f"📧 Email: {_esc_md(email)}\n"
-            f"📚 Гайд: {_esc_md(guide)}\n"
+            "🆕 <b>Новый лид!</b>\n\n"
+            f"👤 Имя: {_esc_html(name)}\n"
+            f"📧 Email: {_esc_html(email)}\n"
+            f"📚 Гайд: {_esc_html(guide)}\n"
             f"💬 Telegram: {username_display}\n"
             f"{source_line}"
-            f"🆔 User ID: `{user_id}`"
+            f"🆔 User ID: <code>{user_id}</code>"
         )
 
         # Кнопки для быстрых действий

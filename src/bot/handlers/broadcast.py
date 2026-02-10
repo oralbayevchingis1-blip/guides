@@ -1,12 +1,17 @@
-"""Команда /broadcast — массовая рассылка сообщений подписчикам.
+"""Команда /broadcast — массовая рассылка с умной сегментацией.
 
-Доступна только администратору (ADMIN_ID).
-Формат: /broadcast Текст сообщения
-Бот показывает подтверждение перед отправкой и прогресс.
+Форматы:
+    /broadcast Текст                — рассылка всем
+    /broadcast #it Текст            — только юзерам с интересами IT
+    /broadcast #corporate Текст     — только корпоративное право
+    /broadcast #startup Текст       — стартапы и IT-бизнес
+
+Сегменты: it, corporate, startup, finance, tax, labor, aifc, m&a
 """
 
 import asyncio
 import logging
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -19,6 +24,9 @@ from src.database.crud import get_all_user_ids
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+# Регулярка для извлечения тегов сегментации
+_TAG_RE = re.compile(r"#(\w+)")
 
 
 class BroadcastStates(StatesGroup):
@@ -44,12 +52,40 @@ async def cmd_broadcast(message: Message, state: FSMContext) -> None:
     if not broadcast_text:
         await message.answer(
             "❌ Укажите текст рассылки.\n\n"
-            "Формат: `/broadcast Ваш текст сообщения`"
+            "Формат: <code>/broadcast Ваш текст сообщения</code>\n\n"
+            "🎯 <b>Сегментация:</b>\n"
+            "<code>/broadcast #it Текст</code> — только IT-юзерам\n"
+            "<code>/broadcast #corporate Текст</code> — корпоративное право\n"
+            "<code>/broadcast #startup Текст</code> — стартапы\n"
+            "<code>/broadcast #finance Текст</code> — финансы\n"
+            "<code>/broadcast #all Текст</code> — всем"
         )
         return
 
-    # Получаем количество пользователей
+    # Извлекаем теги сегментации
+    tags = _TAG_RE.findall(broadcast_text)
+    clean_text = _TAG_RE.sub("", broadcast_text).strip()
+    if not clean_text:
+        clean_text = broadcast_text
+
+    # Получаем пользователей (с сегментацией или всех)
     user_ids = await get_all_user_ids()
+    segment_label = "всем"
+
+    if tags and "all" not in tags:
+        try:
+            from src.bot.utils.growth_engine import segment_users
+            from src.bot.utils.google_sheets import GoogleSheetsClient
+
+            # Пробуем получить google из middleware data
+            google = message.bot.get("google") if hasattr(message.bot, "get") else None
+            if google:
+                leads = await google.get_recent_leads(limit=500)
+                user_ids = segment_users(leads, user_ids, tags)
+            segment_label = f"сегмент: {', '.join(tags)}"
+        except Exception as e:
+            logger.warning("Segmentation failed, sending to all: %s", e)
+
     user_count = len(user_ids)
 
     if user_count == 0:
@@ -57,15 +93,16 @@ async def cmd_broadcast(message: Message, state: FSMContext) -> None:
         return
 
     # Сохраняем текст в FSM и показываем подтверждение
-    await state.update_data(broadcast_text=broadcast_text)
+    await state.update_data(broadcast_text=clean_text, segment_tags=tags)
     await state.set_state(BroadcastStates.confirm)
 
-    preview = broadcast_text[:200] + ("..." if len(broadcast_text) > 200 else "")
+    preview = clean_text[:200] + ("..." if len(clean_text) > 200 else "")
 
     await message.answer(
-        f"📢 *Подтверждение рассылки*\n\n"
+        f"📢 <b>Подтверждение рассылки</b>\n\n"
         f"Текст:\n{preview}\n\n"
-        f"👥 Получателей: *{user_count}*\n\n"
+        f"👥 Получателей: <b>{user_count}</b>\n"
+        f"🎯 Аудитория: <b>{segment_label}</b>\n\n"
         f"Отправить?",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -135,7 +172,7 @@ async def broadcast_confirm(
 
     # Финальный отчёт
     await callback.message.edit_text(
-        f"✅ *Рассылка завершена!*\n\n"
+        f"✅ <b>Рассылка завершена!</b>\n\n"
         f"📊 Всего: {total}\n"
         f"✅ Доставлено: {sent}\n"
         f"❌ Ошибок: {failed}"

@@ -7,7 +7,10 @@ from sqlalchemy import select
 
 from sqlalchemy import func as sa_func
 
-from src.database.models import ConsentLog, Lead, Referral, User, async_session
+from src.database.models import (
+    ConsentLog, FeedbackScore, Lead, PendingSheetsWrite,
+    Referral, User, WaitlistEntry, async_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,19 @@ async def get_or_create_user(
                 logger.info("Пользователь обновлён: user_id=%s", user_id)
 
         return user
+
+
+async def update_user_activity(user_id: int) -> None:
+    """Обновляет last_activity для трекинга последнего взаимодействия."""
+    from datetime import datetime, timezone
+
+    async with async_session() as session:
+        stmt = select(User).where(User.user_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        if user:
+            user.last_activity = datetime.now(timezone.utc)
+            await session.commit()
 
 
 # ──────────────────────── Leads ─────────────────────────────────────────
@@ -183,11 +199,17 @@ async def save_consent_log(log_entry: dict[str, Any]) -> ConsentLog:
     Returns:
         Экземпляр ConsentLog.
     """
+    from datetime import datetime, timezone
+
     async with async_session() as session:
+        # timestamp может быть строкой (legacy) или datetime
+        ts = log_entry.get("timestamp")
+        if isinstance(ts, str):
+            ts = datetime.now(timezone.utc)
         consent = ConsentLog(
             user_id=log_entry["user_id"],
             consent_type=log_entry["consent_type"],
-            timestamp=log_entry["timestamp"],
+            timestamp=ts,
             ip_address=log_entry.get("ip_address"),
             user_agent=log_entry.get("user_agent"),
         )
@@ -196,3 +218,130 @@ async def save_consent_log(log_entry: dict[str, Any]) -> ConsentLog:
         await session.refresh(consent)
         logger.info("Согласие записано: user_id=%s", log_entry["user_id"])
         return consent
+
+
+# ──────────────────────── Referral Milestones ────────────────────────────
+
+async def check_referral_reward(referrer_id: int) -> str | None:
+    """Проверяет, достигнут ли реферальный milestone.
+
+    Returns:
+        Идентификатор награды или None.
+    """
+    from src.bot.utils.growth_engine import check_referral_milestone
+
+    count = await count_referrals(referrer_id)
+    ms = check_referral_milestone(count)
+    return ms["reward"] if ms else None
+
+
+# ──────────────────────── Feedback / NPS ─────────────────────────────────
+
+async def save_feedback_score(user_id: int, score: int, context: str = "") -> FeedbackScore:
+    """Сохраняет NPS-оценку."""
+    async with async_session() as session:
+        fb = FeedbackScore(user_id=user_id, score=score, context=context)
+        session.add(fb)
+        await session.commit()
+        await session.refresh(fb)
+        logger.info("Feedback saved: user_id=%s, score=%d", user_id, score)
+        return fb
+
+
+async def get_feedback_stats() -> dict:
+    """Средний NPS и статистика."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(
+                sa_func.count(FeedbackScore.id),
+                sa_func.avg(FeedbackScore.score),
+            )
+        )
+        row = result.one()
+        total = row[0] or 0
+        avg = float(row[1]) if row[1] else 0.0
+        return {"total": total, "avg": round(avg, 1)}
+
+
+# ──────────────────────── Waitlist ───────────────────────────────────────
+
+async def add_waitlist_entry(user_id: int, service_id: str) -> bool:
+    """Записывает пользователя в waitlist.
+
+    Returns:
+        True если записан, False если уже есть.
+    """
+    async with async_session() as session:
+        existing = await session.execute(
+            select(WaitlistEntry).where(
+                WaitlistEntry.user_id == user_id,
+                WaitlistEntry.service_id == service_id,
+            )
+        )
+        if existing.scalar_one_or_none():
+            return False
+
+        entry = WaitlistEntry(user_id=user_id, service_id=service_id)
+        session.add(entry)
+        await session.commit()
+        logger.info("Waitlist: user_id=%s -> service=%s", user_id, service_id)
+        return True
+
+
+async def get_waitlist_users(service_id: str) -> list[int]:
+    """Получает user_id всех подписавшихся на waitlist."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(WaitlistEntry.user_id).where(
+                WaitlistEntry.service_id == service_id,
+            )
+        )
+        return [row[0] for row in result.all()]
+
+
+# ──────────────────────── User с partner ─────────────────────────────────
+
+async def get_users_by_partner(partner_id: str) -> list[User]:
+    """Пользователи, пришедшие от конкретного партнёра."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(User).where(User.partner_id == partner_id)
+        )
+        return list(result.scalars().all())
+
+
+async def get_partner_stats() -> list[dict]:
+    """Статистика по партнёрам."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(
+                User.partner_id,
+                sa_func.count(User.id).label("count"),
+            )
+            .where(User.partner_id.isnot(None), User.partner_id != "")
+            .group_by(User.partner_id)
+            .order_by(sa_func.count(User.id).desc())
+        )
+        return [
+            {"partner_id": row[0], "leads": row[1]}
+            for row in result.all()
+        ]
+
+
+async def get_sleeping_users(days: int = 14) -> list[User]:
+    """Пользователи, которые не были активны N дней."""
+    from datetime import timedelta
+
+    threshold = datetime.now(timezone.utc) - timedelta(days=days)
+    async with async_session() as session:
+        result = await session.execute(
+            select(User).where(
+                User.last_activity < threshold,
+                User.last_activity.isnot(None),
+            )
+        )
+        return list(result.scalars().all())
+
+
+# --- Import datetime for use in functions ---
+from datetime import datetime, timezone

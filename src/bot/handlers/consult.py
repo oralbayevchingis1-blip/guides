@@ -20,7 +20,8 @@ from aiogram.types import (
     Message,
 )
 
-from src.bot.utils.ai_client import ask_legal
+from src.bot.utils.ai_client import ask_legal_safe
+from src.bot.utils.cache import TTLCache
 from src.bot.utils.google_sheets import GoogleSheetsClient
 from src.config import settings
 
@@ -45,11 +46,11 @@ async def cmd_consult(message: Message, state: FSMContext) -> None:
 
     await state.set_state(ConsultStates.waiting_for_question)
     await message.answer(
-        "🤖 *AI Мини-консультация от SOLIS Partners*\n\n"
+        "🤖 <b>AI Мини-консультация от SOLIS Partners</b>\n\n"
         "Задайте ваш юридический вопрос, и наш AI-ассистент "
         "даст краткий ответ на основе казахстанского законодательства.\n\n"
-        "⚖️ _Обратите внимание: это предварительная консультация, "
-        "не заменяющая полноценную юридическую помощь._\n\n"
+        "⚖️ <i>Обратите внимание: это предварительная консультация, "
+        "не заменяющая полноценную юридическую помощь.</i>\n\n"
         "Напишите ваш вопрос 👇",
     )
 
@@ -61,9 +62,9 @@ async def start_consult_callback(
     """Начало консультации по нажатию кнопки."""
     await state.set_state(ConsultStates.waiting_for_question)
     await callback.message.answer(
-        "🤖 *AI Мини-консультация от SOLIS Partners*\n\n"
+        "🤖 <b>AI Мини-консультация от SOLIS Partners</b>\n\n"
         "Задайте ваш юридический вопрос 👇\n\n"
-        "⚖️ _Ответ носит ознакомительный характер._",
+        "⚖️ <i>Ответ носит ознакомительный характер.</i>",
     )
     await callback.answer()
 
@@ -73,9 +74,9 @@ async def start_consult_callback(
 
 @router.message(ConsultStates.waiting_for_question)
 async def process_question(
-    message: Message, state: FSMContext, google: GoogleSheetsClient
+    message: Message, state: FSMContext, google: GoogleSheetsClient, cache: TTLCache,
 ) -> None:
-    """Получаем вопрос, отправляем в Gemini, возвращаем ответ."""
+    """Получаем вопрос, отправляем в Gemini (с RAG-контекстом), возвращаем ответ."""
     question = message.text.strip() if message.text else ""
 
     # Пропуск команд
@@ -89,11 +90,53 @@ async def process_question(
         )
         return
 
+    # P5: Телеметрия
+    try:
+        from src.bot.utils.telemetry import track_event
+        asyncio.create_task(track_event(message.from_user.id, "consult_question"))
+    except Exception:
+        pass
+
+    # C5: Sentiment Analysis — определение срочности
+    try:
+        from src.bot.utils.email_sender import analyze_sentiment, send_urgency_alert
+        sentiment = analyze_sentiment(question)
+        if sentiment["needs_alert"]:
+            asyncio.create_task(
+                send_urgency_alert(message.bot, message.from_user.id, question, sentiment)
+            )
+    except Exception:
+        pass
+
     # Показываем что думаем
     thinking_msg = await message.answer("🔍 Анализирую ваш вопрос...")
 
     try:
-        answer = await ask_legal(question)
+        # L3+C8: Legal Search + Practice Area context
+        from src.bot.utils.legal_search import search_legal_context
+        from src.bot.utils.vector_search import (
+            get_practice_context,
+            search_consult_history,
+            format_search_results,
+        )
+
+        rag_context = await search_legal_context(question, google, cache)
+
+        # C8: Practice Area AI — узкоспециализированный контекст
+        practice_ctx = get_practice_context(question)
+        if practice_ctx:
+            rag_context = f"{practice_ctx}\n\n{rag_context}" if rag_context else practice_ctx
+
+        # C9: Vector Search 2.0 — похожие прецеденты
+        try:
+            similar = await search_consult_history(question, google, cache, top_k=3)
+            precedent_ctx = format_search_results(similar)
+            if precedent_ctx:
+                rag_context = f"{rag_context}\n\n{precedent_ctx}" if rag_context else precedent_ctx
+        except Exception:
+            pass
+
+        answer = await ask_legal_safe(question, context=rag_context)
 
         # Логируем вопрос для Auto-FAQ
         asyncio.create_task(
@@ -104,16 +147,56 @@ async def process_question(
             )
         )
 
-        # Формируем ответ с CTA
+        # Lead Scoring — фоновый анализ потенциала клиента
+        try:
+            from src.bot.utils.lead_scoring import analyze_and_score_lead
+            asyncio.create_task(
+                analyze_and_score_lead(message.from_user.id, google, cache, message.bot)
+            )
+        except Exception:
+            pass  # scoring is non-critical
+
+        # Планируем NPS-запрос через 2 часа
+        try:
+            from src.bot.handlers.feedback import schedule_feedback
+            from src.bot.utils.scheduler import get_scheduler
+            scheduler = get_scheduler()
+            if scheduler:
+                schedule_feedback(scheduler, message.bot, message.from_user.id, delay_hours=2.0)
+        except Exception:
+            pass  # NPS is non-critical
+
+        # Формируем ответ с CTA (HTML)
         response = (
-            f"🤖 *Ответ AI-ассистента SOLIS Partners:*\n\n"
+            f"🤖 <b>Ответ AI-ассистента SOLIS Partners:</b>\n\n"
             f"{answer}\n\n"
-            f"---\n"
-            f"⚖️ _Данная информация носит ознакомительный характер "
-            f"и не является юридической консультацией._"
+            f"───────────────\n"
+            f"⚖️ <i>Данная информация носит ознакомительный характер "
+            f"и не является юридической консультацией.</i>"
         )
 
-        # Кнопки: записаться, задать ещё вопрос, назад к гайдам
+        # Сохраняем для Live Support
+        try:
+            from src.bot.handlers.live_support import save_ai_exchange
+            save_ai_exchange(message.from_user.id, question, answer[:500])
+        except Exception:
+            pass
+
+        # P5: Телеметрия — ответ получен
+        try:
+            from src.bot.utils.telemetry import track_event
+            asyncio.create_task(track_event(message.from_user.id, "consult_answered"))
+        except Exception:
+            pass
+
+        # Карма за консультацию
+        try:
+            from src.bot.utils.karma import add_karma
+            add_karma(message.from_user.id, 0, "consult")
+        except Exception:
+            pass
+
+        # Кнопки: записаться, задать ещё, позвать человека, гайды
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -126,6 +209,12 @@ async def process_question(
                     InlineKeyboardButton(
                         text="🔄 Задать ещё вопрос",
                         callback_data="start_consult",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="👨‍⚖️ Позвать живого юриста",
+                        callback_data="call_human",
                     ),
                 ],
                 [
@@ -146,11 +235,11 @@ async def process_question(
         try:
             await message.answer(response, reply_markup=keyboard)
         except Exception:
-            # Если markdown не парсится — отправляем без форматирования
+            # Если HTML не парсится — отправляем без форматирования
             plain = (
                 "🤖 Ответ AI-ассистента SOLIS Partners:\n\n"
                 f"{answer}\n\n"
-                "---\n"
+                "───────────────\n"
                 "⚖️ Данная информация носит ознакомительный характер "
                 "и не является юридической консультацией."
             )

@@ -2,6 +2,8 @@
 управление статьями, дата-рум, новости, AI-диалоги, контент-календарь."""
 
 import asyncio
+import functools
+import json as _json
 import logging
 from datetime import datetime, timezone
 
@@ -9,6 +11,74 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 logger = logging.getLogger(__name__)
+
+
+# ── Circuit Breaker / Retry ─────────────────────────────────────────────
+
+_consecutive_failures: int = 0
+_CIRCUIT_OPEN_THRESHOLD = 5
+
+
+def retry_sheets(max_retries: int = 3, initial_delay: float = 1.0):
+    """Декоратор: retry с экспоненциальным backoff для Google Sheets API."""
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            global _consecutive_failures
+            delay = initial_delay
+            last_exc = None
+            for attempt in range(max_retries):
+                try:
+                    result = func(*args, **kwargs)
+                    _consecutive_failures = 0  # reset on success
+                    return result
+                except gspread.exceptions.APIError as e:
+                    last_exc = e
+                    status = getattr(getattr(e, "response", None), "status_code", 0)
+                    if status == 429:
+                        logger.warning(
+                            "Sheets quota exceeded, retry %d/%d in %.1fs",
+                            attempt + 1, max_retries, delay,
+                        )
+                        import time
+                        time.sleep(delay)
+                        delay *= 2
+                    else:
+                        _consecutive_failures += 1
+                        raise
+                except Exception as e:
+                    last_exc = e
+                    _consecutive_failures += 1
+                    if attempt == max_retries - 1:
+                        raise
+                    logger.warning(
+                        "Sheets attempt %d/%d failed: %s", attempt + 1, max_retries, e,
+                    )
+                    import time
+                    time.sleep(delay)
+                    delay *= 2
+            raise last_exc  # type: ignore[misc]
+
+        return wrapper
+
+    return decorator
+
+
+async def save_pending_write(method_name: str, payload: dict) -> None:
+    """Сохраняет неудавшуюся запись в SQLite для повторной отправки."""
+    try:
+        from src.database.models import PendingSheetsWrite, async_session
+        async with async_session() as session:
+            pending = PendingSheetsWrite(
+                method_name=method_name,
+                payload_json=_json.dumps(payload, ensure_ascii=False, default=str),
+            )
+            session.add(pending)
+            await session.commit()
+            logger.info("Pending write saved: %s", method_name)
+    except Exception as e:
+        logger.error("Failed to save pending write: %s", e)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -32,7 +102,7 @@ SHEET_CONSULT_LOG = "Consult Log"
 def _safe_get_all_records(ws) -> list[dict]:
     """Безопасно читает все записи из листа, даже при дубликатах заголовков."""
     try:
-        return _safe_get_all_records(ws)
+        return ws.get_all_records()
     except Exception:
         # Если заголовки дублируются или пусты — читаем вручную
         vals = ws.get_all_values()
@@ -84,6 +154,7 @@ class GoogleSheetsClient:
 
     # ── Каталог гайдов ──────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_get_catalog(self) -> list[dict]:
         """Синхронное чтение листа «Каталог гайдов»."""
         try:
@@ -114,6 +185,7 @@ class GoogleSheetsClient:
 
     # ── Тексты бота ─────────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_get_texts(self) -> dict[str, str]:
         """Синхронное чтение листа «Тексты бота»."""
         try:
@@ -144,6 +216,7 @@ class GoogleSheetsClient:
 
     # ── Запись лидов ────────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_append_lead(self, lead_row: list) -> None:
         """Синхронная запись строки в лист «Лиды»."""
         try:
@@ -155,6 +228,7 @@ class GoogleSheetsClient:
         except Exception as e:
             logger.error("Ошибка записи лида в Sheets: %s", e)
 
+    @retry_sheets()
     def _sync_update_lead_interests(self, user_id: int, guide: str) -> None:
         """Обновляет колонки 'Интересы' и 'Warmth' для существующего лида.
 
@@ -264,6 +338,7 @@ class GoogleSheetsClient:
 
     # ── Авто-серия follow-up ────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_get_followup_series(self) -> dict[str, str]:
         """Синхронное чтение листа «Авто-серия»."""
         try:
@@ -294,6 +369,7 @@ class GoogleSheetsClient:
 
     # ── Аналитика ───────────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_update_analytics(self) -> None:
         """Синхронное обновление листа «Аналитика» на основе данных из «Лиды»."""
         try:
@@ -310,14 +386,14 @@ class GoogleSheetsClient:
             # Читаем лиды
             try:
                 ws_leads = spreadsheet.worksheet(SHEET_LEADS)
-                leads = ws_leads.get_all_records()
+                leads = _safe_get_all_records(ws_leads)
             except gspread.exceptions.WorksheetNotFound:
                 leads = []
 
             # Читаем каталог для подсчёта
             try:
                 ws_catalog = spreadsheet.worksheet(SHEET_CATALOG)
-                catalog = ws_catalog.get_all_records()
+                catalog = _safe_get_all_records(ws_catalog)
             except gspread.exceptions.WorksheetNotFound:
                 catalog = []
 
@@ -398,6 +474,7 @@ class GoogleSheetsClient:
 
     # ── Статьи сайта ────────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_append_article(self, row: list) -> None:
         """Синхронная запись статьи в лист «Статьи сайта»."""
         try:
@@ -450,6 +527,7 @@ class GoogleSheetsClient:
 
     # ── Каталог гайдов (добавление) ─────────────────────────────────────
 
+    @retry_sheets()
     def _sync_append_guide(self, row: list) -> None:
         """Синхронная запись гайда в лист «Каталог гайдов»."""
         try:
@@ -474,6 +552,7 @@ class GoogleSheetsClient:
 
     # ── Google Drive (загрузка файлов) ──────────────────────────────────
 
+    @retry_sheets()
     def _sync_upload_to_drive(
         self, local_path: str, filename: str, folder_id: str
     ) -> str | None:
@@ -614,6 +693,7 @@ class GoogleSheetsClient:
 
     # ── Data Room (знания о компании) ────────────────────────────────────
 
+    @retry_sheets()
     def _sync_get_data_room(self) -> list[dict]:
         """Читает лист «Data Room» — контекст компании для AI."""
         try:
@@ -630,6 +710,7 @@ class GoogleSheetsClient:
         """Асинхронно получает данные Data Room."""
         return await asyncio.to_thread(self._sync_get_data_room)
 
+    @retry_sheets()
     def _sync_append_data_room(self, row: list) -> None:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_DATA_ROOM)
@@ -645,6 +726,7 @@ class GoogleSheetsClient:
 
     # ── News Feed ────────────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_append_news(self, row: list) -> None:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_NEWS)
@@ -662,6 +744,7 @@ class GoogleSheetsClient:
         row = [now, source, title, url, summary, ""]
         await asyncio.to_thread(self._sync_append_news, row)
 
+    @retry_sheets()
     def _sync_get_recent_news(self, limit: int = 20) -> list[dict]:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_NEWS)
@@ -678,6 +761,7 @@ class GoogleSheetsClient:
 
     # ── Лиды (расширенные методы) ────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_get_recent_leads(self, limit: int = 50) -> list[dict]:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_LEADS)
@@ -693,6 +777,7 @@ class GoogleSheetsClient:
 
     # ── Статьи (список, toggle) ──────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_get_articles_list(self, limit: int = 20) -> list[dict]:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_ARTICLES)
@@ -708,6 +793,7 @@ class GoogleSheetsClient:
         """Возвращает список статей."""
         return await asyncio.to_thread(self._sync_get_articles_list, limit)
 
+    @retry_sheets()
     def _sync_toggle_article(self, article_id: str) -> bool:
         """Переключает active для статьи. Возвращает новое состояние."""
         try:
@@ -743,6 +829,7 @@ class GoogleSheetsClient:
 
     # ── Гайды (удаление) ─────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_delete_guide(self, guide_id: str) -> bool:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_CATALOG)
@@ -762,6 +849,7 @@ class GoogleSheetsClient:
 
     # ── AI Conversations ─────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_log_ai_conversation(self, admin_msg: str, ai_resp: str) -> None:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_AI_CONV)
@@ -782,6 +870,7 @@ class GoogleSheetsClient:
 
     # ── Consult Log (логирование вопросов пользователей) ─────────────────
 
+    @retry_sheets()
     def _sync_log_consult(self, user_id: int, question: str, answer: str) -> None:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_CONSULT_LOG)
@@ -799,6 +888,7 @@ class GoogleSheetsClient:
         """Логирует вопрос из /consult для Auto-FAQ."""
         await asyncio.to_thread(self._sync_log_consult, user_id, question, answer)
 
+    @retry_sheets()
     def _sync_get_consult_log(self, limit: int = 100) -> list[dict]:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_CONSULT_LOG)
@@ -815,6 +905,7 @@ class GoogleSheetsClient:
 
     # ── Content Calendar ─────────────────────────────────────────────────
 
+    @retry_sheets()
     def _sync_append_content_plan(self, row: list) -> None:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_CONTENT_CAL)
@@ -830,6 +921,7 @@ class GoogleSheetsClient:
         row = [date, content_type, title, status, ""]
         await asyncio.to_thread(self._sync_append_content_plan, row)
 
+    @retry_sheets()
     def _sync_get_content_calendar(self) -> list[dict]:
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_CONTENT_CAL)
@@ -842,3 +934,43 @@ class GoogleSheetsClient:
 
     async def get_content_calendar(self) -> list[dict]:
         return await asyncio.to_thread(self._sync_get_content_calendar)
+
+    # ── Lead Scoring ─────────────────────────────────────────────────────
+
+    @retry_sheets()
+    def _sync_update_lead_score(self, user_id: int, score: int, label: str) -> None:
+        """Обновляет AI-скоринг лида в Sheets."""
+        try:
+            ws = self._get_spreadsheet().worksheet(SHEET_LEADS)
+            rows = _safe_get_all_records(ws)
+            header = ws.row_values(1)
+
+            # Ищем / создаём колонки ai_score и ai_label
+            score_col = None
+            label_col = None
+            for i, h in enumerate(header, start=1):
+                if h.lower() == "ai_score":
+                    score_col = i
+                elif h.lower() == "ai_label":
+                    label_col = i
+
+            if score_col is None:
+                score_col = len(header) + 1
+                ws.update_cell(1, score_col, "ai_score")
+                header.append("ai_score")
+            if label_col is None:
+                label_col = len(header) + 1
+                ws.update_cell(1, label_col, "ai_label")
+
+            for idx, row in enumerate(rows, start=2):
+                if str(row.get("user_id", "")) == str(user_id):
+                    ws.update_cell(idx, score_col, str(score))
+                    ws.update_cell(idx, label_col, label)
+
+            logger.info("Lead scoring updated: user_id=%s score=%d label=%s", user_id, score, label)
+        except Exception as e:
+            logger.error("Lead scoring update error: %s", e)
+
+    async def update_lead_score(self, user_id: int, score: int, label: str) -> None:
+        """Асинхронно обновляет скоринг лида."""
+        await asyncio.to_thread(self._sync_update_lead_score, user_id, score, label)

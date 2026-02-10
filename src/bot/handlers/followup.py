@@ -2,11 +2,20 @@
 
 Тексты серии загружаются из Google Sheets (лист «Авто-серия»).
 Если лист недоступен, используются fallback-тексты.
+
+Умное удержание (Churn Prevention):
+- Step 1 (24ч): персонализированный вопрос на основе темы гайда
+- Step 2 (3 дня): практический кейс + AI-генерированный вопрос
+- Step 3 (7 дней): предложение бесплатной мини-консультации
+
+AI анализирует тему гайда и генерирует релевантный вопрос,
+чтобы вовлечь пользователя в диалог.
 """
 
 import logging
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.bot.utils.cache import TTLCache
 from src.bot.utils.google_sheets import GoogleSheetsClient
@@ -29,12 +38,80 @@ FALLBACK_FOLLOWUP: dict[int, str] = {
     ),
     3: (
         "🎯 Добрый день! Надеемся, гайд оказался полезным.\n\n"
-        "Мы предлагаем *бесплатную мини-консультацию* (15 минут) "
+        "Мы предлагаем <b>бесплатную мини-консультацию</b> (15 минут) "
         "по теме гайда с нашим специалистом.\n\n"
         "Для записи напишите нам: @SOLISlegal\n\n"
         "📚 Посмотреть другие гайды: /start"
     ),
 }
+
+# Маппинг guide_id -> тема для AI-персонализации
+_GUIDE_TOPICS: dict[str, str] = {
+    "too": "регистрация ТОО в Казахстане",
+    "ip": "открытие ИП в Казахстане",
+    "mfca": "регистрация компании в МФЦА (AIFC)",
+    "esop": "опционные программы ESOP для стартапов",
+    "taxes": "налогообложение в Казахстане",
+    "labor": "трудовое право и найм сотрудников",
+    "it_law": "IT-право и защита данных",
+    "ma": "сделки M&A и корпоративное право",
+}
+
+
+async def _generate_personalized_question(guide_id: str, step: int) -> str | None:
+    """AI генерирует персонализированный вопрос на основе темы гайда.
+
+    Returns:
+        Персонализированный текст или None при ошибке.
+    """
+    topic = _GUIDE_TOPICS.get(guide_id, "")
+    if not topic:
+        # Попробуем извлечь тему из ID
+        topic = guide_id.replace("_", " ").replace("-", " ")
+
+    try:
+        from src.bot.utils.ai_client import ask_marketing
+
+        step_instructions = {
+            1: (
+                f"Пользователь скачал гайд по теме «{topic}» 24 часа назад.\n"
+                "Напиши КОРОТКОЕ (2-3 предложения) дружеское сообщение:\n"
+                "1. Поинтересуйся, удалось ли начать изучение\n"
+                "2. Задай КОНКРЕТНЫЙ практический вопрос по теме гайда\n"
+                "   (например: 'Возникли ли сложности с регистрацией в e-gov?')\n"
+                "3. Предложи помощь от SOLIS Partners"
+            ),
+            2: (
+                f"Пользователь скачал гайд по теме «{topic}» 3 дня назад, "
+                "но не прошёл консультацию.\n"
+                "Напиши сообщение (3-4 предложения):\n"
+                "1. Расскажи о РЕАЛЬНОМ кейсе по этой теме (придумай убедительный)\n"
+                "2. Задай вопрос, который заставит задуматься о необходимости юриста\n"
+                "3. Упомяни бесплатную AI-консультацию через /consult"
+            ),
+            3: (
+                f"Пользователь скачал гайд по теме «{topic}» неделю назад, "
+                "не консультировался и может уйти.\n"
+                "Напиши МОТИВИРУЮЩЕЕ сообщение (3-4 предложения):\n"
+                "1. Предложи бесплатную 15-минутную мини-консультацию\n"
+                "2. Объясни, чем это полезно конкретно для его темы\n"
+                "3. Создай мягкую срочность ('на этой неделе')\n"
+                "4. Дай ссылку на @SOLISlegal"
+            ),
+        }
+
+        instruction = step_instructions.get(step, step_instructions[1])
+
+        result = await ask_marketing(
+            prompt=instruction,
+            max_tokens=256,
+            temperature=0.7,
+        )
+        return result.strip()
+
+    except Exception as e:
+        logger.warning("AI followup generation failed: %s", e)
+        return None
 
 
 async def send_followup_message(
@@ -57,31 +134,82 @@ async def send_followup_message(
         cache: TTL-кеш.
     """
     try:
-        # Пробуем загрузить тексты серии из Google Sheets
-        followup_texts = await cache.get_or_fetch(
-            "followup_series",
-            google.get_followup_series,
+        # 1. Проверяем: может пользователь уже прошёл консультацию?
+        consult_log = await google.get_consult_log(limit=50)
+        user_consulted = any(
+            str(row.get("user_id", row.get("User ID", ""))) == str(user_id)
+            for row in consult_log
         )
 
-        # Ищем текст по ключу: step_{N} или guide_{guide_id}_step_{N}
-        specific_key = f"{guide_id}_step_{step}"
-        generic_key = f"step_{step}"
-
-        text = (
-            followup_texts.get(specific_key)
-            or followup_texts.get(generic_key)
-            or FALLBACK_FOLLOWUP.get(step, "")
-        )
-
-        if not text:
-            logger.warning(
-                "Текст follow-up не найден: step=%d, guide=%s", step, guide_id
+        if user_consulted and step == 1:
+            # Пользователь уже вовлечён — отправляем лёгкий follow-up
+            text = (
+                "👋 Рады, что вы уже воспользовались нашей AI-консультацией!\n\n"
+                "Если возникнут новые вопросы — пишите /consult, "
+                "а для углублённой проработки обращайтесь к @SOLISlegal."
             )
+            await bot.send_message(chat_id=user_id, text=text)
+            logger.info("Follow-up (consulted user): user_id=%s, step=%d", user_id, step)
             return
 
-        await bot.send_message(chat_id=user_id, text=text)
+        # 2. Пробуем AI-генерацию персонализированного вопроса
+        ai_text = await _generate_personalized_question(guide_id, step)
+
+        # 3. Если AI не справился — fallback из Sheets или стандартный
+        if not ai_text:
+            followup_texts = await cache.get_or_fetch(
+                "followup_series",
+                google.get_followup_series,
+            )
+
+            specific_key = f"{guide_id}_step_{step}"
+            generic_key = f"step_{step}"
+
+            ai_text = (
+                followup_texts.get(specific_key)
+                or followup_texts.get(generic_key)
+                or FALLBACK_FOLLOWUP.get(step, "")
+            )
+
+        if not ai_text:
+            logger.warning("Текст follow-up не найден: step=%d, guide=%s", step, guide_id)
+            return
+
+        # 4. Добавляем кнопки для вовлечения
+        buttons = [
+            [InlineKeyboardButton(
+                text="🤖 Задать вопрос AI-юристу",
+                callback_data="start_consult",
+            )],
+            [InlineKeyboardButton(
+                text="📚 Другие гайды",
+                callback_data="show_all_guides",
+            )],
+        ]
+        if step >= 2:
+            buttons.insert(0, [InlineKeyboardButton(
+                text="📞 Записаться на консультацию",
+                url="https://t.me/SOLISlegal",
+            )])
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=ai_text,
+                reply_markup=keyboard,
+            )
+        except Exception:
+            await bot.send_message(
+                chat_id=user_id,
+                text=ai_text,
+                reply_markup=keyboard,
+                parse_mode=None,
+            )
+
         logger.info(
-            "Follow-up отправлен: user_id=%s, guide=%s, step=%d",
+            "Follow-up отправлен: user_id=%s, guide=%s, step=%d (AI-personalized)",
             user_id, guide_id, step,
         )
     except Exception as e:

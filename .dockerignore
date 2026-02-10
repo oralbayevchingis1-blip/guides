@@ -1,0 +1,16 @@
+.git
+__pycache__
+*.pyc
+.env
+venv
+.venv
+tests
+*.md
+legal-partner-pro-review
+.cursor
+data
+*.db
+telegraph_token.txt
+test_*.py
+.mypy_cache
+.pytest_cache

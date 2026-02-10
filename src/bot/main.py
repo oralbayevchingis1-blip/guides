@@ -1,4 +1,7 @@
-"""Точка входа Telegram-бота SOLIS Partners — AI-powered marketing hub."""
+"""Точка входа Telegram-бота SOLIS Partners — AI-powered marketing hub.
+
+v2.0: Enterprise-grade stability, deep analytics, OWASP security.
+"""
 
 import asyncio
 import logging
@@ -12,16 +15,29 @@ from aiogram.types import BotCommand, BotCommandScopeChat
 from src.bot.handlers import (
     admin,
     broadcast,
+    cabinet,
     consult,
     content_manager,
+    corporate,
+    documents,
+    feedback,
+    group_mode,
+    language,
     lead_form,
+    legal_tools,
+    live_support,
+    payments,
     referral,
     start,
     subscription,
+    timezone_handler,
+    voice,
+    waitlist_handler,
 )
 from src.bot.handlers import digest, strategy
 from src.bot.handlers.followup import send_followup_message
 from src.bot.middlewares.logging_mw import LoggingMiddleware
+from src.bot.utils.ai_client import get_orchestrator
 from src.bot.utils.cache import TTLCache
 from src.bot.utils.google_sheets import GoogleSheetsClient
 from src.bot.utils.scheduler import get_scheduler
@@ -36,8 +52,20 @@ logger = logging.getLogger(__name__)
 # Команды для всех пользователей
 USER_COMMANDS = [
     BotCommand(command="start", description="Начать / выбрать гайд"),
-    BotCommand(command="consult", description="AI-юрист — задать вопрос"),
+    BotCommand(command="consult", description="AI-юрист — задать вопрос (текст/голос)"),
+    BotCommand(command="profile", description="Личный кабинет и карма"),
+    BotCommand(command="review", description="AI DocReview — анализ договоров"),
+    BotCommand(command="brainstorm", description="Консилиум 3-х AI-юристов"),
+    BotCommand(command="doc", description="Генератор юридических документов"),
+    BotCommand(command="bin", description="Проверка контрагента по БИН"),
+    BotCommand(command="remind", description="Напоминание о дедлайне"),
+    BotCommand(command="booking", description="Запись на консультацию"),
+    BotCommand(command="docgen", description="Генератор документов (.docx)"),
+    BotCommand(command="mytasks", description="Мои задачи"),
+    BotCommand(command="shop", description="Премиум услуги"),
     BotCommand(command="referral", description="Реферальная программа"),
+    BotCommand(command="lang", description="Выбор языка / Тіл / Language"),
+    BotCommand(command="timezone", description="Часовой пояс"),
 ]
 
 # Команды для администратора
@@ -47,8 +75,22 @@ ADMIN_COMMANDS = [
     BotCommand(command="publish", description="Опубликовать статью"),
     BotCommand(command="chat", description="Чат с AI-стратегом"),
     BotCommand(command="consult", description="AI-юрист — задать вопрос"),
-    BotCommand(command="broadcast", description="Рассылка пользователям"),
+    BotCommand(command="broadcast", description="Рассылка (#сегмент)"),
+    BotCommand(command="reply", description="Ответить пользователю"),
+    BotCommand(command="doc", description="Генератор документов"),
+    BotCommand(command="shop", description="Каталог услуг"),
+    BotCommand(command="profile", description="Личный кабинет"),
     BotCommand(command="referral", description="Реферальная программа"),
+    BotCommand(command="lang", description="Выбор языка"),
+    BotCommand(command="timezone", description="Часовой пояс"),
+    BotCommand(command="waitlist", description="Coming Soon услуги"),
+    BotCommand(command="report", description="Dashboard 24ч"),
+    BotCommand(command="growth", description="Growth-отчёт"),
+    BotCommand(command="tasks", description="Тикеты / задачи"),
+    BotCommand(command="funnel", description="Воронка продаж"),
+    BotCommand(command="audit", description="Аудит безопасности"),
+    BotCommand(command="errors", description="Статистика ошибок"),
+    BotCommand(command="refresh", description="Сброс кеша"),
 ]
 
 
@@ -72,7 +114,22 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     )
-    logger.info("Запуск бота...")
+
+    # P9: Ротация логов (RotatingFileHandler)
+    from src.bot.utils.log_manager import setup_log_rotation
+    setup_log_rotation()
+
+    logger.info("Запуск бота v%s...", settings.VERSION)
+
+    # P4: Sentry SDK (если SENTRY_DSN задан)
+    from src.bot.utils.sentry_integration import init_sentry
+    init_sentry()
+
+    # P3: Проверка конфигурации при старте
+    from src.bot.utils.validators import check_config_sanity
+    config_warnings = check_config_sanity()
+    for w in config_warnings:
+        logger.warning("CONFIG: %s", w)
 
     # Инициализация БД (SQLite backup)
     await init_db()
@@ -87,14 +144,18 @@ async def main() -> None:
     # Инициализация бота и диспетчера
     bot = Bot(
         token=settings.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
+    # AI Orchestrator (единый AI-клиент с aiohttp)
+    ai = get_orchestrator()
+
     # Внедрение зависимостей — доступны в хендлерах как аргументы
     dp["google"] = google
     dp["cache"] = cache
+    dp["ai"] = ai
 
     # Запуск планировщика
     scheduler = get_scheduler()
@@ -119,31 +180,221 @@ async def main() -> None:
 
     register_scheduled_jobs(scheduler, bot=bot, google=google, cache=cache)
 
-    # Middleware
-    dp.message.middleware(LoggingMiddleware())
+    # Еженедельный VACUUM + backup БД (воскресенье 03:00 UTC)
+    from src.backup import scheduled_backup
+    scheduler.add_job(
+        scheduled_backup,
+        trigger="cron",
+        day_of_week="sun",
+        hour=3, minute=0,
+        id="weekly_db_maintenance",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Retention Loop — ежедневная проверка спящих пользователей (08:00 UTC)
+    from src.bot.utils.retention import check_sleeping_users
+
+    async def _retention_check():
+        await check_sleeping_users(bot=bot, google=google, cache=cache)
+
+    scheduler.add_job(
+        _retention_check,
+        trigger="cron",
+        hour=8, minute=0,
+        id="daily_retention_check",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Weekly Growth Hacker Report (понедельник 09:00 UTC)
+    from src.bot.utils.growth_report import send_growth_report
+
+    async def _growth_report():
+        await send_growth_report(bot=bot, google=google, cache=cache)
+
+    scheduler.add_job(
+        _growth_report,
+        trigger="cron",
+        day_of_week="mon",
+        hour=9, minute=0,
+        id="weekly_growth_report",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Auto-Stories: проверка новых статей каждые 4 часа
+    from src.bot.utils.stories_publisher import auto_stories_check
+
+    async def _auto_stories():
+        await auto_stories_check(bot=bot, google=google, cache=cache)
+
+    scheduler.add_job(
+        _auto_stories,
+        trigger="interval",
+        hours=4,
+        id="auto_stories_check",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # P5: Телеметрия — сброс событий в Google Sheets каждые 6 часов
+    from src.bot.utils.telemetry import scheduled_telemetry_flush, weekly_funnel_analysis
+
+    async def _telemetry_flush():
+        await scheduled_telemetry_flush(google=google, cache=cache)
+
+    scheduler.add_job(
+        _telemetry_flush,
+        trigger="interval",
+        hours=6,
+        id="telemetry_flush",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # P5: Еженедельный AI-анализ воронки (среда 10:00 UTC)
+    async def _funnel_analysis():
+        await weekly_funnel_analysis(bot=bot, google=google, cache=cache)
+
+    scheduler.add_job(
+        _funnel_analysis,
+        trigger="cron",
+        day_of_week="wed",
+        hour=10, minute=0,
+        id="weekly_funnel_analysis",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # P6: Ежедневный бэкап БД → отправка админу (04:00 UTC)
+    from src.backup import daily_backup
+
+    async def _daily_backup():
+        await daily_backup(bot=bot)
+
+    scheduler.add_job(
+        _daily_backup,
+        trigger="cron",
+        hour=4, minute=0,
+        id="daily_db_backup",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # C10: Еженедельный QA аудит качества (пятница 16:00 UTC = 21:00 Алматы)
+    from src.bot.utils.vector_search import scheduled_qa_audit
+
+    async def _qa_audit():
+        await scheduled_qa_audit(bot=bot, google=google, cache=cache)
+
+    scheduler.add_job(
+        _qa_audit,
+        trigger="cron",
+        day_of_week="fri",
+        hour=16, minute=0,
+        id="weekly_qa_audit",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # P9: Очистка кеша/temp каждые 12 часов
+    from src.bot.utils.log_manager import scheduled_cleanup
+
+    scheduler.add_job(
+        scheduled_cleanup,
+        trigger="interval",
+        hours=12,
+        id="cache_cleanup",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # ── Middleware (порядок: outer → inner → handler → inner → outer) ──
+
+    # P1: Global Error Handler (САМЫЙ ВНЕШНИЙ — ловит всё)
+    from src.bot.middlewares.error_handler import ErrorHandlingMiddleware
+    error_mw = ErrorHandlingMiddleware(bot)
+    dp.message.middleware(error_mw)
+    dp.callback_query.middleware(error_mw)
+
+    # Self-Healing Middleware — AI-диагностика ошибок + уведомления админа
+    from src.monitoring import SelfHealingMiddleware
+    healing_mw = SelfHealingMiddleware(bot)
+    dp.message.middleware(healing_mw)
+    dp.callback_query.middleware(healing_mw)
+
+    # P2: Throttling Middleware — общий антифлуд (1 msg/sec)
+    from src.bot.middlewares.throttle import ThrottlingMiddleware
+    throttle_mw = ThrottlingMiddleware()
+    dp.message.middleware(throttle_mw)
+    dp.callback_query.middleware(throttle_mw)
+
+    # Middleware — TraceMiddleware для messages и callback queries
+    trace_mw = LoggingMiddleware()
+    dp.message.middleware(trace_mw)
+    dp.callback_query.middleware(trace_mw)
+
+    # AI Rate Limit Middleware — анти-флуд (5 AI-запросов в час на пользователя)
+    from src.bot.middlewares.rate_limit import AIRateLimitMiddleware
+    ai_limit_mw = AIRateLimitMiddleware(daily_limit=10)
+    dp.message.middleware(ai_limit_mw)
+    dp.callback_query.middleware(ai_limit_mw)
 
     # Регистрация роутеров
     # ПОРЯДОК ВАЖЕН: команды (/start, /consult, /chat, /referral) должны
     # обрабатываться РАНЬШЕ FSM-роутеров (content_manager, lead_form),
     # иначе FSM-состояние перехватит команду.
     dp.include_router(start.router)            # /start — всегда доступен
-    dp.include_router(admin.router)            # /refresh
+    dp.include_router(admin.router)            # /refresh, /report, /growth
+    dp.include_router(live_support.router)     # /reply + Live Support FSM
     dp.include_router(consult.router)          # /consult
+    dp.include_router(voice.router)            # голосовые сообщения → Whisper
     dp.include_router(strategy.router)         # /chat
+    dp.include_router(payments.router)         # /shop + Payments
+    dp.include_router(cabinet.router)          # /profile, /karma
+    dp.include_router(legal_tools.router)       # /review, /brainstorm, /bin, /tasks, /remind
+    dp.include_router(corporate.router)        # /booking, /docgen, /mytasks, /invoice
+    dp.include_router(documents.router)        # /doc + FSM
     dp.include_router(referral.router)         # /referral
-    dp.include_router(broadcast.router)        # /broadcast
+    dp.include_router(broadcast.router)        # /broadcast #сегмент
     dp.include_router(content_manager.router)  # /admin, /publish + FSM
     dp.include_router(digest.router)           # дайджест колбеки
+    dp.include_router(language.router)         # /lang выбор языка
+    dp.include_router(timezone_handler.router) # /timezone + геолокация
+    dp.include_router(waitlist_handler.router) # waitlist Coming Soon
     dp.include_router(subscription.router)     # подписка колбеки
-    dp.include_router(lead_form.router)        # лид-форма FSM
+    dp.include_router(feedback.router)         # NPS/feedback колбеки
+    dp.include_router(group_mode.router)       # мониторинг групп
+    dp.include_router(lead_form.router)        # лид-форма FSM (последний — ловит всё)
+
+    # P8: Healthcheck HTTP API для Docker
+    from src.bot.utils.healthcheck import start_healthcheck, stop_healthcheck, set_ready
+    await start_healthcheck(bot=bot)
+
+    # P10: Аудит безопасности при старте (логируем результат)
+    try:
+        from src.bot.utils.security_audit import run_security_audit
+        audit = run_security_audit()
+        logger.info("Security audit: %s — %d issues (%d critical)",
+                     audit["grade"], audit["total_issues"], audit["critical"])
+        if audit["critical"] > 0:
+            logger.warning("⚠️ CRITICAL security issues found! Review immediately.")
+    except Exception as e:
+        logger.warning("Security audit skipped: %s", e)
 
     # Запуск бота
-    logger.info("Бот запущен и слушает обновления")
+    logger.info("Бот запущен и слушает обновления (v%s)", settings.VERSION)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await _register_commands(bot)
+        set_ready(True)
         await dp.start_polling(bot)
     finally:
+        set_ready(False)
+        await stop_healthcheck()
+        await ai.close()
+        logger.info("AI сессия закрыта")
         if scheduler.running:
             scheduler.shutdown(wait=False)
             logger.info("APScheduler остановлен")

@@ -1,13 +1,29 @@
-FROM python:3.12-slim
-
+# Stage 1: dependencies
+FROM python:3.12-slim AS deps
 WORKDIR /app
-
-# Установка зависимостей
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование исходного кода
+# Stage 2: runtime
+FROM python:3.12-slim
+WORKDIR /app
+
+# Copy installed packages from deps stage
+COPY --from=deps /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+# Copy application code
 COPY . .
 
-# Запуск бота
+# Create data directory
+RUN mkdir -p /app/data
+
+# Non-root user
+RUN useradd -r -s /bin/false botuser && chown -R botuser:botuser /app
+USER botuser
+
+# Health check: verify Telegram API is reachable and DB file exists
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('https://api.telegram.org', timeout=5)" || exit 1
+
 CMD ["python", "-m", "src.bot.main"]

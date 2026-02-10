@@ -61,7 +61,34 @@ def register_scheduled_jobs(
         misfire_grace_time=3600,
     )
 
-    logger.info("Запланированы: утренний дайджест (09:00) и вечерний отчёт (18:00) Алматы")
+    # Auto-FAQ Discovery — ежедневно в 02:00 UTC (07:00 Алматы)
+    async def _auto_faq():
+        from src.bot.utils.auto_faq import run_auto_faq_discovery
+        await run_auto_faq_discovery(google=google, cache=cache, bot=bot)
+
+    scheduler.add_job(
+        _auto_faq,
+        trigger="cron",
+        hour=2, minute=0,  # UTC
+        id="auto_faq_daily",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Проактивный контент-хантер — каждые 2 часа ищет критические новости
+    async def _content_hunter():
+        await proactive_content_hunter(bot=bot, google=google, cache=cache)
+
+    scheduler.add_job(
+        _content_hunter,
+        trigger="interval",
+        hours=2,
+        id="content_hunter_2h",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    logger.info("Запланированы: утренний дайджест (09:00), вечерний отчёт (18:00), контент-хантер (каждые 2ч) Алматы")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -121,6 +148,25 @@ async def send_morning_digest(
             max_tokens=2048,
         )
 
+        # L9: AI-анализ влияния новостей на бизнес клиентов
+        impact_analysis = ""
+        if news_items:
+            try:
+                impact_analysis = await ask_digest(
+                    prompt=(
+                        "Ты — юрист-аналитик SOLIS Partners. Проанализируй эти новости.\n"
+                        "Для каждой важной новости напиши:\n"
+                        "📌 <b>Для бизнеса это значит:</b> [конкретное влияние]\n"
+                        "✅ <b>Рекомендуем:</b> [что сделать клиентам]\n\n"
+                        "Если новость требует обновления документов — укажи каких.\n"
+                        "Формат: HTML для Telegram. Кратко, по делу."
+                    ),
+                    context=f"НОВОСТИ:\n{news_text}",
+                    max_tokens=1024,
+                )
+            except Exception as e:
+                logger.warning("News impact analysis failed: %s", e)
+
         # 5. Сохраняем новости в Sheets
         for item in news_items[:10]:
             asyncio.create_task(google.append_news(
@@ -132,12 +178,20 @@ async def send_morning_digest(
 
         # 6. Отправляем админу
         now = datetime.now(ALMATY_TZ)
-        header = f"🌅 *Утренний дайджест — {now.strftime('%d.%m.%Y')}*\n\n"
+        header = f"🌅 <b>Утренний дайджест — {now.strftime('%d.%m.%Y')}</b>\n\n"
 
         news_count = len(news_items)
         header += f"📰 Найдено новостей: {news_count}\n\n"
 
         message = header + ai_response
+
+        # L9: Добавляем анализ влияния если есть
+        if impact_analysis:
+            message += (
+                "\n\n───────────────\n"
+                "🔍 <b>Анализ влияния на клиентов:</b>\n\n"
+                + impact_analysis
+            )
 
         # Ограничиваем длину сообщения
         if len(message) > 4000:
@@ -209,13 +263,13 @@ async def send_evening_report(
         if not today_leads:
             await bot.send_message(
                 chat_id=settings.ADMIN_ID,
-                text=f"📊 *Вечерний отчёт — {today}*\n\nНовых лидов за сегодня: 0\nЗавтра будет больше! 💪",
+                text=f"📊 <b>Вечерний отчёт — {today}</b>\n\nНовых лидов за сегодня: 0\nЗавтра будет больше! 💪",
             )
             return
 
         # Формируем сообщение
-        text = f"📊 *Вечерний отчёт — {today}*\n\n"
-        text += f"🔥 Новых лидов сегодня: *{len(today_leads)}*\n\n"
+        text = f"📊 <b>Вечерний отчёт — {today}</b>\n\n"
+        text += f"🔥 Новых лидов сегодня: <b>{len(today_leads)}</b>\n\n"
 
         buttons = []
         for i, lead in enumerate(today_leads[:5], 1):
@@ -226,7 +280,7 @@ async def send_evening_report(
             contacted = lead.get("contacted", "")
 
             status = "✅" if contacted else "⚠️"
-            text += f"{status} *{name}* ({email})\n"
+            text += f"{status} <b>{name}</b> ({email})\n"
             text += f"   📄 {guide}\n"
             if username:
                 text += f"   💬 @{username}\n"
@@ -243,7 +297,7 @@ async def send_evening_report(
 
         not_contacted = [l for l in today_leads if not l.get("contacted")]
         if not_contacted:
-            text += f"\n⚠️ *Не обработано: {len(not_contacted)}* — свяжитесь с ними!"
+            text += f"\n⚠️ <b>Не обработано: {len(not_contacted)}</b> — свяжитесь с ними!"
 
         buttons.append([InlineKeyboardButton(
             text="📊 Открыть CRM",
@@ -307,6 +361,161 @@ async def digest_channel(callback: CallbackQuery) -> None:
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  ПРОАКТИВНЫЙ КОНТЕНТ-ХАНТЕР (Autonomous Drafting)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def proactive_content_hunter(
+    *,
+    bot: Bot,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Каждые 2 часа ищет критически важные новости.
+
+    Если обнаружены изменения в законах РК или критические новости —
+    автоматически создаёт черновик поста в Content Calendar и отправляет
+    админу кнопку «Опубликовать в один клик».
+    """
+    try:
+        from src.bot.utils.news_parser import fetch_all_news
+        from src.bot.utils.ai_client import ask_marketing
+
+        news_items = await fetch_all_news()
+        if not news_items:
+            return
+
+        # Формируем текст для AI-анализа
+        news_text = "\n".join(
+            f"- [{n.get('source', '')}] {n.get('title', '')}: {n.get('summary', '')[:150]}"
+            for n in news_items[:15]
+        )
+
+        analysis = await ask_marketing(
+            prompt=(
+                "Проанализируй следующие новости и определи КРИТИЧЕСКИ ВАЖНЫЕ "
+                "для клиентов юридической фирмы в Казахстане.\n\n"
+                "Критерии критичности:\n"
+                "- Изменения в законодательстве РК (новые законы, поправки)\n"
+                "- Решения МФЦА, регулятора, ВС РК\n"
+                "- Крупные сделки M&A, IPO в регионе\n"
+                "- Кибербезопасность и защита данных\n\n"
+                "Для КАЖДОЙ критически важной новости верни JSON-массив:\n"
+                '[{"title": "Заголовок поста", "type": "article|channel_post", '
+                '"urgency": "high|medium", "summary": "Краткое описание 1-2 предложения", '
+                '"source_url": "ссылка"}]\n\n'
+                "Если нет критических новостей — верни пустой массив: []\n\n"
+                f"НОВОСТИ:\n{news_text}"
+            ),
+            max_tokens=1024,
+            temperature=0.3,
+        )
+
+        # Парсим JSON из ответа AI
+        import json as _json
+        import re
+
+        json_match = re.search(r'\[.*\]', analysis, re.DOTALL)
+        if not json_match:
+            return
+
+        try:
+            critical_items = _json.loads(json_match.group())
+        except _json.JSONDecodeError:
+            logger.warning("Content hunter: invalid JSON from AI")
+            return
+
+        if not critical_items or not isinstance(critical_items, list):
+            return
+
+        now = datetime.now(ALMATY_TZ)
+        date_str = now.strftime("%Y-%m-%d")
+
+        for item in critical_items[:3]:  # Макс 3 черновика за раз
+            title = item.get("title", "Без заголовка")
+            content_type = item.get("type", "article")
+            summary = item.get("summary", "")
+            urgency = item.get("urgency", "medium")
+
+            # Сохраняем черновик в Content Calendar
+            await google.append_content_plan(
+                date=date_str,
+                content_type=content_type,
+                title=f"[DRAFT] {title}",
+                status="draft",
+            )
+
+            # Отправляем админу уведомление с кнопкой
+            urgency_emoji = "🚨" if urgency == "high" else "📰"
+            msg_text = (
+                f"{urgency_emoji} <b>Контент-хантер нашёл важную новость!</b>\n\n"
+                f"<b>{title}</b>\n"
+                f"{summary}\n\n"
+                f"📋 Черновик добавлен в Content Calendar.\n"
+                f"Тип: {content_type}"
+            )
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="📝 Опубликовать статью",
+                        callback_data="hunter_publish",
+                    )],
+                    [InlineKeyboardButton(
+                        text="📢 Пост в канал",
+                        callback_data="hunter_channel",
+                    )],
+                    [InlineKeyboardButton(
+                        text="❌ Пропустить",
+                        callback_data="digest_ack",
+                    )],
+                ]
+            )
+
+            try:
+                await bot.send_message(
+                    chat_id=settings.ADMIN_ID,
+                    text=msg_text,
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                await bot.send_message(
+                    chat_id=settings.ADMIN_ID,
+                    text=msg_text,
+                    reply_markup=keyboard,
+                    parse_mode=None,
+                )
+
+        logger.info("Content hunter: найдено %d критических новостей", len(critical_items))
+
+    except Exception as e:
+        logger.error("Content hunter error: %s", e)
+
+
+@router.callback_query(F.data == "hunter_publish")
+async def hunter_publish(callback: CallbackQuery) -> None:
+    """Быстрая публикация из контент-хантера."""
+    if callback.from_user.id != settings.ADMIN_ID:
+        return
+    await callback.answer()
+    await callback.message.answer(
+        "📝 Скопируйте заголовок новости и отправьте /publish — "
+        "AI автоматически развернёт её в полноценную статью."
+    )
+
+
+@router.callback_query(F.data == "hunter_channel")
+async def hunter_channel(callback: CallbackQuery) -> None:
+    """Быстрый канальный пост из контент-хантера."""
+    if callback.from_user.id != settings.ADMIN_ID:
+        return
+    await callback.answer()
+    await callback.message.answer(
+        "📢 Скопируйте заголовок и отправьте мне — сгенерирую пост для канала."
+    )
+
+
 @router.callback_query(F.data == "digest_more")
 async def digest_more_ideas(
     callback: CallbackQuery,
@@ -339,7 +548,7 @@ async def digest_more_ideas(
         )
 
         await callback.message.answer(
-            f"💡 *Дополнительные идеи:*\n\n{response}",
+            f"💡 <b>Дополнительные идеи:</b>\n\n{response}",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="📝 Опубликовать", callback_data="digest_publish")],

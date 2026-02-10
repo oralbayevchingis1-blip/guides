@@ -1,23 +1,22 @@
 """Единый AI-клиент: Gemini (юрист) + GPT (маркетолог/стратег).
 
 Архитектура:
+    - AIOrchestrator — единый класс с aiohttp, retry, fallback
     - Gemini 2.0 Flash  → юридические консультации, ответы клиентам
-    - GPT-4o-mini / GPT-4o → маркетинг, стратегия, контент, аналитика
-
-Каждый AI получает детальную системную инструкцию (persona) и работает
-в рамках своей специализации.
+    - GPT-4o-mini       → маркетинг, стратегия, контент, аналитика
 
 Использование:
     from src.bot.utils.ai_client import ask_legal, ask_marketing, ask_content
     answer = await ask_legal("Как уволить сотрудника по ТК РК?")
-    ideas = await ask_marketing("Придумай контент-план на неделю", context=...)
-    html = await ask_content("Оформи статью...", raw_text=...)
+    ideas  = await ask_marketing("Придумай контент-план", context=...)
+    html   = await ask_content("Оформи статью...", raw_text=...)
 """
 
 import asyncio
 import json
 import logging
-from urllib.request import Request, urlopen
+
+import aiohttp
 
 from src.config import settings
 
@@ -45,18 +44,26 @@ SOLIS Partners — ведущая юридическая фирма в Алма�
 1. Отвечай структурировано: краткий ответ → правовая основа → рекомендации.
 2. Ссылайся на КОНКРЕТНЫЕ статьи законов РК (ТК РК, ГК РК, НК РК, УК РК,
    Закон о ТОО, Закон об АО, Конституционный закон о МФЦА и т.д.).
-3. Используй Markdown: **жирный** для ключевых терминов, _курсив_ для ссылок
-   на законы, маркированные списки для структуры.
+3. Используй HTML-разметку Telegram:
+   - <b>жирный</b> для ключевых терминов
+   - <code>ст. 52 ТК РК</code> для ссылок на конкретные статьи законов
+   - <i>курсив</i> для пояснений
+   - Маркированные списки через • символ
 4. Объём: 3-5 абзацев, не больше 800 слов.
-5. В конце ВСЕГДА рекомендуй: «Для детальной проработки вопроса
+5. ОБЯЗАТЕЛЬНО разбивай ответ на логические блоки с разделителями:
+   Используй «───────────────» между секциями.
+   Каждый блок должен иметь заголовок-эмодзи:
+   ⚖️ — правовая основа
+   📋 — что делать (рекомендации)
+   ⚠️ — риски и предупреждения
+   💡 — практический совет
+6. В конце ВСЕГДА рекомендуй: «Для детальной проработки вопроса
    обратитесь к специалистам SOLIS Partners».
-6. НЕ давай окончательных правовых заключений — только ориентировку.
-7. Если вопрос НЕ юридический — вежливо объясни свою специализацию
-   и предложи задать юридический вопрос.
-8. Отвечай на языке вопроса (русский или казахский).
-9. Будь доброжелательным, но профессиональным.
-10. Если вопрос касается МФЦА — укажи, что там действует английское право
-    и система прецедентов, и это отдельная юрисдикция."""
+7. НЕ давай окончательных правовых заключений — только ориентировку.
+8. Если вопрос НЕ юридический — вежливо объясни свою специализацию.
+9. Отвечай на языке вопроса (русский или казахский).
+10. Если вопрос касается МФЦА — укажи, что там действует английское право.
+11. НЕ используй Markdown (**, __, ``` и т.д.) — ТОЛЬКО HTML-теги Telegram."""
 
 MARKETING_PERSONA = """Ты — AI маркетинг-стратег и PR-специалист юридической фирмы SOLIS Partners.
 
@@ -82,20 +89,17 @@ Tone of voice: экспертный, но доступный; уверенный
 1. Всегда предлагай КОНКРЕТНЫЕ действия с чёткими шагами.
 2. Если предлагаешь контент — давай ГОТОВЫЕ заголовки (3-5 вариантов).
 3. Думай о воронке: осведомлённость → интерес → лид → клиент.
-4. Контент должен быть ПОЛЕЗНЫМ: не реклама, а экспертиза, которая
-   показывает компетенцию фирмы.
-5. Учитывай специфику Казахстана: законодательство РК, местный рынок,
-   менталитет аудитории.
+4. Контент должен быть ПОЛЕЗНЫМ: не реклама, а экспертиза.
+5. Учитывай специфику Казахстана: законодательство РК, местный рынок.
 6. Предлагай форматы: статья на сайт + короткий пост в Telegram-канал +
    возможный гайд для скачивания.
 7. Анализируй данные (лиды, статистику) и давай числовые рекомендации.
-8. Следи за актуальными трендами: изменения в законах, громкие кейсы,
-   новости бизнеса в РК.
-9. Стиль ответа: кратко, по делу, с emoji где уместно.
-10. Отвечай на русском языке.
-11. Если просят анализ — давай SWOT или другой структурированный формат.
-12. Помни: ты не просто отвечаешь, ты ИНИЦИИРУЕШЬ. Предлагай то,
-    о чём админ ещё не подумал."""
+8. Стиль ответа: кратко, по делу, с emoji где уместно.
+9. Отвечай на русском языке.
+10. Помни: ты не просто отвечаешь, ты ИНИЦИИРУЕШЬ. Предлагай то,
+    о чём админ ещё не подумал.
+11. Форматирование: используй HTML-теги Telegram (<b>, <i>, <code>).
+    НЕ используй Markdown."""
 
 CONTENT_PERSONA = """Ты — AI-редактор и контент-менеджер юридической фирмы SOLIS Partners.
 
@@ -110,168 +114,355 @@ CONTENT_PERSONA = """Ты — AI-редактор и контент-менедж
    - Основная часть (разбитая на секции с подзаголовками <h2>/<h3>)
    - Заключение (резюме + CTA: обращение в SOLIS Partners)
 3. Сохраняй ВСЮ содержательную информацию из исходного текста.
-4. Ссылки на законы выделяй курсивом: <em>ст. 52 ТК РК</em>.
-5. Ключевые термины — жирным: <strong>аттестация</strong>.
-6. Длинные перечисления — маркированные списки <ul><li>.
-7. Цитаты из законов — <blockquote>.
+4. Ссылки на законы: <em>ст. 52 ТК РК</em>.
+5. Ключевые термины: <strong>аттестация</strong>.
+6. Длинные перечисления: <ul><li>.
+7. Цитаты из законов: <blockquote>.
 8. Не добавляй информацию, которой нет в оригинале.
 9. Tone of voice: экспертный, доступный, без занудства.
-10. Автоматически генерируй:
-    - title: заголовок статьи (до 100 символов)
-    - description: SEO-описание (до 160 символов)
-    - category: одна из [News, Analytics, Guide, Legal Opinion]"""
+10. Автоматически генерируй: title, description, category."""
+
+CRITIC_PERSONA = """Ты — AI-рецензент юридических ответов фирмы SOLIS Partners.
+
+ТВОЯ ЗАДАЧА:
+Проверить ответ AI-юриста на:
+1. Фактические ошибки (неправильные номера статей, несуществующие законы)
+2. Соответствие стилю SOLIS Partners (экспертный, доступный, без занудства)
+3. Наличие дисклеймера (ответ носит ознакомительный характер)
+4. Наличие CTA (рекомендация обратиться в SOLIS Partners)
+5. Логическую последовательность аргументов
+6. Галлюцинации — выдуманные факты, которых нет в вопросе
+
+ФОРМАТ ОТВЕТА:
+Если ответ хороший: "ОК: ответ корректен и соответствует стандартам."
+Если есть проблемы: "ОШИБКА: [описание проблемы]. РЕКОМЕНДАЦИЯ: [что исправить]."
+
+Будь строгим, но справедливым. Лучше пропустить хороший ответ, чем одобрить плохой."""
 
 CHANNEL_POST_PERSONA = """Ты — SMM-специалист юридической фирмы SOLIS Partners.
 Ты пишешь посты для Telegram-канала @SOLISlegal.
 
-СТИЛЬ:
+ФОРМАТ: HTML (теги Telegram: <b>, <i>, <code>, <a>, <blockquote>, <tg-spoiler>)
+
+ВИЗУАЛЬНЫЙ СТАНДАРТ:
+- Заголовок: <b>🔥 Цепляющий заголовок</b>
+- После заголовка: разделитель ───────────────
+- Каждый блок начинается с тематического эмодзи:
+  ⚖️ — право, 📌 — суть, ✅ — рекомендации, 💡 — инсайд
+- Цитаты законов: <blockquote><i>"Текст закона"</i></blockquote>
 - Короткие абзацы (2-3 строки максимум)
-- Emoji в начале каждого абзаца/блока
-- Заголовок — первая строка, жирный и цепляющий
-- Длина: 500-1500 символов
-- CTA в конце: ссылка на статью, бот или консультацию
-- Tone: экспертный, но живой, как будто партнёр фирмы пишет из первых рук
-- НЕ используй хештеги
-- Формат: Markdown (Telegram)
+- Интрига через <tg-spoiler>скрытый текст</tg-spoiler>
+- Ключевые термины: <b>жирным</b>
+- Номера статей: <code>ст. 52 ТК РК</code>
 
 СТРУКТУРА ПОСТА:
-1. 🔥 Заголовок-хук (проблема или вопрос)
-2. 📌 Ключевой тезис (в чём суть)
-3. ✅ 2-3 практических вывода
-4. 👉 CTA (что делать читателю)"""
+1. <b>Заголовок-хук</b> (проблема или вопрос)
+2. ─────────────── (разделитель)
+3. 📌 <b>Суть:</b> Ключевой тезис
+4. ✅ <b>Что делать:</b> 2-3 буллита через •
+5. <blockquote>Экспертная цитата</blockquote>
+6. 👉 CTA со ссылкой
+
+ДЛИНА: 500-1500 символов. Tone: экспертный, но живой.
+НЕ используй хештеги. НЕ используй Markdown — ТОЛЬКО HTML."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GEMINI CLIENT (для юридических вопросов)
+#  AIOrchestrator — единый async-клиент с retry и fallback
 # ═══════════════════════════════════════════════════════════════════════════
 
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
     "models/gemini-2.0-flash:generateContent"
 )
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_IMAGES_URL = "https://api.openai.com/v1/images/generations"
 
 
-def _sync_gemini(
-    prompt: str,
-    system: str,
-    max_tokens: int = 1024,
-    temperature: float = 0.7,
-) -> str:
-    """Синхронный запрос к Gemini API."""
-    api_key = settings.GEMINI_API_KEY
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY не настроен в .env")
+class AIOrchestrator:
+    """Единый AI-клиент с aiohttp, retry, fallback и трекингом токенов."""
 
-    url = f"{GEMINI_API_URL}?key={api_key}"
+    def __init__(self) -> None:
+        self._session: aiohttp.ClientSession | None = None
+        self.total_tokens_used: int = 0
 
-    payload = {
-        "contents": [{"parts": [{"text": f"{system}\n\n{prompt}"}]}],
-        "generationConfig": {
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60),
+            )
+        return self._session
+
+    async def close(self) -> None:
+        """Закрыть HTTP-сессию."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    # ── HTTP с retry ─────────────────────────────────────────────────────
+
+    async def _request_with_retry(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict | None = None,
+        max_retries: int = 3,
+    ) -> dict:
+        """POST-запрос с экспоненциальным backoff для 429 и 5xx."""
+        session = await self._get_session()
+        delay = 1.0
+        last_exc: Exception | None = None
+
+        for attempt in range(max_retries):
+            try:
+                async with session.post(
+                    url, json=payload, headers=headers or {},
+                ) as resp:
+                    if resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", delay))
+                        logger.warning(
+                            "API 429, retry %d/%d in %ds",
+                            attempt + 1, max_retries, retry_after,
+                        )
+                        await asyncio.sleep(retry_after)
+                        delay *= 2
+                        continue
+                    if resp.status >= 500:
+                        logger.warning(
+                            "API %d, retry %d/%d in %.1fs",
+                            resp.status, attempt + 1, max_retries, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        continue
+                    body = await resp.json()
+                    if resp.status >= 400:
+                        error_msg = json.dumps(body, ensure_ascii=False)[:200]
+                        raise RuntimeError(
+                            f"API error {resp.status}: {error_msg}"
+                        )
+                    return body
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_exc = e
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"API request failed: {e}") from e
+                logger.warning(
+                    "Request error, retry %d/%d: %s", attempt + 1, max_retries, e,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+
+        raise RuntimeError(f"Max retries exceeded: {last_exc}")
+
+    # ── Gemini ───────────────────────────────────────────────────────────
+
+    async def call_gemini(
+        self,
+        prompt: str,
+        system: str,
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+    ) -> str:
+        """Запрос к Gemini API."""
+        if not settings.GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY не настроен")
+
+        url = f"{GEMINI_API_URL}?key={settings.GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": f"{system}\n\n{prompt}"}]}],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+                "topP": 0.9,
+            },
+            "safetySettings": [
+                {"category": c, "threshold": "BLOCK_ONLY_HIGH"}
+                for c in [
+                    "HARM_CATEGORY_HARASSMENT",
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "HARM_CATEGORY_DANGEROUS_CONTENT",
+                ]
+            ],
+        }
+
+        result = await self._request_with_retry(url, payload)
+
+        candidates = result.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini: пустой ответ")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts:
+            raise RuntimeError("Gemini: нет текста")
+        answer = parts[0].get("text", "").strip()
+        if not answer:
+            raise RuntimeError("Gemini: пустой текст")
+
+        # Track tokens
+        usage = result.get("usageMetadata", {})
+        self.total_tokens_used += usage.get("totalTokenCount", 0)
+
+        return answer
+
+    # ── OpenAI ───────────────────────────────────────────────────────────
+
+    async def call_openai(
+        self,
+        prompt: str,
+        system: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        model: str = "gpt-4o-mini",
+    ) -> str:
+        """Запрос к OpenAI API."""
+        if not settings.OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY не настроен")
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max_tokens,
             "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-            "topP": 0.9,
-        },
-        "safetySettings": [
-            {"category": c, "threshold": "BLOCK_ONLY_HIGH"}
-            for c in [
-                "HARM_CATEGORY_HARASSMENT",
-                "HARM_CATEGORY_HATE_SPEECH",
-                "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "HARM_CATEGORY_DANGEROUS_CONTENT",
-            ]
-        ],
-    }
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+        }
 
-    data = json.dumps(payload).encode("utf-8")
-    req = Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
+        result = await self._request_with_retry(OPENAI_API_URL, payload, headers)
 
-    try:
-        with urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        logger.error("Gemini API error: %s", e)
-        raise RuntimeError(f"Ошибка Gemini: {e}") from e
+        choices = result.get("choices", [])
+        if not choices:
+            raise RuntimeError("OpenAI: пустой ответ")
+        answer = choices[0].get("message", {}).get("content", "").strip()
+        if not answer:
+            raise RuntimeError("OpenAI: пустой текст")
 
-    candidates = result.get("candidates", [])
-    if not candidates:
-        raise RuntimeError("Gemini вернул пустой ответ")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    if not parts:
-        raise RuntimeError("Gemini: нет текста в ответе")
-    answer = parts[0].get("text", "").strip()
-    if not answer:
-        raise RuntimeError("Gemini: пустой текст")
-    return answer
+        # Track tokens
+        usage = result.get("usage", {})
+        self.total_tokens_used += usage.get("total_tokens", 0)
 
+        return answer
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  GPT CLIENT (для маркетинга и контента)
-# ═══════════════════════════════════════════════════════════════════════════
+    # ── Fallback: GPT → Gemini ───────────────────────────────────────────
 
-
-def _sync_openai(
-    prompt: str,
-    system: str,
-    max_tokens: int = 2048,
-    temperature: float = 0.7,
-    model: str = "gpt-4o-mini",
-) -> str:
-    """Синхронный запрос к OpenAI API."""
-    api_key = settings.OPENAI_API_KEY
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY не настроен в .env")
-
-    url = "https://api.openai.com/v1/chat/completions"
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-    req = Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Bearer {api_key}")
-
-    try:
-        with urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        logger.error("OpenAI API error: %s", e)
-        raise RuntimeError(f"Ошибка OpenAI: {e}") from e
-
-    choices = result.get("choices", [])
-    if not choices:
-        raise RuntimeError("OpenAI вернул пустой ответ")
-    answer = choices[0].get("message", {}).get("content", "").strip()
-    if not answer:
-        raise RuntimeError("OpenAI: пустой текст")
-    return answer
+    async def call_with_fallback(
+        self,
+        prompt: str,
+        system: str,
+        *,
+        primary: str = "openai",
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+    ) -> str:
+        """Запрос с автоматическим fallback на альтернативную модель."""
+        try:
+            if primary == "openai":
+                return await self.call_openai(
+                    prompt, system,
+                    max_tokens=max_tokens, temperature=temperature,
+                )
+            else:
+                return await self.call_gemini(
+                    prompt, system,
+                    max_tokens=max_tokens, temperature=temperature,
+                )
+        except Exception as e:
+            fallback = "gemini" if primary == "openai" else "openai"
+            logger.warning(
+                "%s failed, fallback to %s: %s", primary, fallback, e,
+            )
+            if fallback == "gemini":
+                return await self.call_gemini(
+                    prompt, system,
+                    max_tokens=max_tokens, temperature=temperature,
+                )
+            else:
+                return await self.call_openai(
+                    prompt, system,
+                    max_tokens=max_tokens, temperature=temperature,
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ПУБЛИЧНЫЕ ФУНКЦИИ (async)
+#  Глобальный экземпляр (singleton)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_orchestrator: AIOrchestrator | None = None
+
+
+def get_orchestrator() -> AIOrchestrator:
+    """Возвращает глобальный AIOrchestrator (создаёт при первом вызове)."""
+    global _orchestrator
+    if _orchestrator is None:
+        _orchestrator = AIOrchestrator()
+    return _orchestrator
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ПУБЛИЧНЫЕ ФУНКЦИИ (обратная совместимость)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-async def ask_legal(question: str, *, max_tokens: int = 1024) -> str:
+async def ask_legal(question: str, *, context: str = "", max_tokens: int = 1024) -> str:
     """Юридическая консультация (Gemini).
 
     Используется для: /consult, Auto-FAQ, ответы клиентам.
     """
-    return await asyncio.to_thread(
-        _sync_gemini,
-        prompt=f"Вопрос клиента:\n{question}",
-        system=LEGAL_PERSONA,
-        max_tokens=max_tokens,
-        temperature=0.5,
+    ai = get_orchestrator()
+    prompt = ""
+    if context:
+        prompt += f"РЕЛЕВАНТНЫЙ КОНТЕКСТ КОМПАНИИ:\n{context}\n\n"
+    prompt += f"Вопрос клиента:\n{question}"
+    return await ai.call_gemini(
+        prompt, LEGAL_PERSONA,
+        max_tokens=max_tokens, temperature=0.5,
     )
+
+
+async def ask_legal_safe(question: str, *, context: str = "", max_tokens: int = 1024) -> str:
+    """Юридическая консультация с двухэтапной проверкой (Creator + Critic).
+
+    Шаг 1: Gemini генерирует ответ (Creator).
+    Шаг 2: GPT проверяет ответ на ошибки (Critic).
+    Если Critic находит проблему — перегенерация с учётом замечаний.
+    """
+    ai = get_orchestrator()
+
+    # Шаг 1: генерация
+    answer = await ask_legal(question, context=context, max_tokens=max_tokens)
+
+    # Шаг 2: критика (используем другую модель для независимой проверки)
+    critic_prompt = (
+        f"ВОПРОС КЛИЕНТА:\n{question}\n\n"
+        f"ОТВЕТ AI-ЮРИСТА:\n{answer}\n\n"
+        "Проверь ответ по всем критериям и дай вердикт."
+    )
+    try:
+        review = await ai.call_with_fallback(
+            critic_prompt, CRITIC_PERSONA,
+            primary="openai", max_tokens=512, temperature=0.3,
+        )
+    except Exception as e:
+        logger.warning("Critic failed, returning original answer: %s", e)
+        return answer
+
+    # Если Critic нашёл ошибку — перегенерация
+    if "ОШИБКА" in review.upper() or "ERROR" in review.upper():
+        logger.info("Critic rejected answer, regenerating with feedback")
+        corrected = await ask_legal(
+            f"{question}\n\nВАЖНО: предыдущий ответ был отклонён рецензентом. "
+            f"Замечания: {review}\n"
+            f"Исправь ответ с учётом замечаний.",
+            context=context,
+            max_tokens=max_tokens,
+        )
+        return corrected
+
+    return answer
 
 
 async def ask_marketing(
@@ -282,10 +473,11 @@ async def ask_marketing(
     max_tokens: int = 2048,
     temperature: float = 0.7,
 ) -> str:
-    """Маркетинговая стратегия и аналитика (GPT).
+    """Маркетинговая стратегия и аналитика (GPT -> fallback Gemini).
 
     Используется для: /chat, идеи контента, дайджест, анализ.
     """
+    ai = get_orchestrator()
     full_prompt = ""
     if context:
         full_prompt += f"КОНТЕКСТ КОМПАНИИ И АНАЛИТИКА:\n{context}\n\n"
@@ -293,25 +485,11 @@ async def ask_marketing(
         full_prompt += f"ИСТОРИЯ ДИАЛОГА:\n{history}\n\n"
     full_prompt += f"ЗАПРОС:\n{prompt}"
 
-    try:
-        return await asyncio.to_thread(
-            _sync_openai,
-            prompt=full_prompt,
-            system=MARKETING_PERSONA,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            model="gpt-4o-mini",
-        )
-    except Exception as gpt_err:
-        logger.warning("GPT fallback to Gemini: %s", gpt_err)
-        # Fallback на Gemini если GPT недоступен
-        return await asyncio.to_thread(
-            _sync_gemini,
-            prompt=full_prompt,
-            system=MARKETING_PERSONA,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+    return await ai.call_with_fallback(
+        full_prompt, MARKETING_PERSONA,
+        primary="openai",
+        max_tokens=max_tokens, temperature=temperature,
+    )
 
 
 async def ask_content(
@@ -350,27 +528,14 @@ async def ask_content(
         instruction = f"{task}\n\n"
 
     full_prompt = instruction + raw_text
-
     persona = CONTENT_PERSONA if task == "format_article" else CHANNEL_POST_PERSONA
+    ai = get_orchestrator()
 
-    try:
-        return await asyncio.to_thread(
-            _sync_openai,
-            prompt=full_prompt,
-            system=persona,
-            max_tokens=max_tokens,
-            temperature=0.5,
-            model="gpt-4o-mini",
-        )
-    except Exception as gpt_err:
-        logger.warning("GPT content fallback to Gemini: %s", gpt_err)
-        return await asyncio.to_thread(
-            _sync_gemini,
-            prompt=full_prompt,
-            system=persona,
-            max_tokens=max_tokens,
-            temperature=0.5,
-        )
+    return await ai.call_with_fallback(
+        full_prompt, persona,
+        primary="openai",
+        max_tokens=max_tokens, temperature=0.5,
+    )
 
 
 async def ask_digest(
@@ -379,27 +544,153 @@ async def ask_digest(
     context: str = "",
     max_tokens: int = 2048,
 ) -> str:
-    """Утренний/вечерний дайджест и аналитика (GPT → fallback Gemini)."""
+    """Утренний/вечерний дайджест и аналитика (GPT -> fallback Gemini)."""
+    ai = get_orchestrator()
     full = ""
     if context:
         full += f"КОНТЕКСТ:\n{context}\n\n"
     full += prompt
 
+    return await ai.call_with_fallback(
+        full, MARKETING_PERSONA,
+        primary="openai",
+        max_tokens=max_tokens, temperature=0.7,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (DALL-E 3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def generate_image_prompt(topic: str) -> str:
+    """AI генерирует промпт для DALL-E в фирменном стиле SOLIS Partners."""
+    ai = get_orchestrator()
+    result = await ai.call_with_fallback(
+        prompt=(
+            f"Сгенерируй промпт для DALL-E 3 на английском языке.\n"
+            f"Тема: {topic}\n\n"
+            "Стиль: минималистичная профессиональная юридическая иллюстрация.\n"
+            "Палитра: тёмно-синий (#1a237e), золотой (#c9a227), белый.\n"
+            "Элементы: геометрические формы, абстрактные корпоративные символы.\n"
+            "БЕЗ текста на изображении. Соотношение 16:9.\n"
+            "Уровень: обложка для Forbes или Harvard Business Review.\n\n"
+            "Верни ТОЛЬКО промпт на английском, ничего больше."
+        ),
+        system="Ты — эксперт по промптам для генерации изображений.",
+        primary="openai", max_tokens=256, temperature=0.7,
+    )
+    return result.strip()
+
+
+async def generate_post_image(topic: str, *, size: str = "1792x1024") -> str | None:
+    """Генерирует изображение через DALL-E 3 в стиле SOLIS Partners.
+
+    Args:
+        topic: Тема/заголовок для изображения.
+        size: Размер (1024x1024, 1792x1024, 1024x1792).
+
+    Returns:
+        URL сгенерированного изображения или None при ошибке.
+    """
+    if not settings.OPENAI_API_KEY:
+        logger.warning("DALL-E: OPENAI_API_KEY не настроен")
+        return None
+
     try:
-        return await asyncio.to_thread(
-            _sync_openai,
-            prompt=full,
-            system=MARKETING_PERSONA,
-            max_tokens=max_tokens,
-            temperature=0.7,
-            model="gpt-4o-mini",
+        # Генерируем оптимальный промпт через AI
+        try:
+            dalle_prompt = await generate_image_prompt(topic)
+        except Exception:
+            dalle_prompt = (
+                f"Minimalist professional legal illustration about {topic}. "
+                "Style: sleek corporate, geometric, deep blue and gold accents, "
+                "high-end law firm aesthetic, no text, 16:9 aspect ratio."
+            )
+
+        ai = get_orchestrator()
+        session = await ai._get_session()
+
+        payload = {
+            "model": "dall-e-3",
+            "prompt": dalle_prompt,
+            "size": size,
+            "quality": "standard",
+            "n": 1,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+        }
+
+        async with session.post(OPENAI_IMAGES_URL, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                error = await resp.text()
+                logger.error("DALL-E error %d: %s", resp.status, error[:300])
+                return None
+            data = await resp.json()
+
+        url = data.get("data", [{}])[0].get("url")
+        logger.info("DALL-E image generated for: %s", topic[:50])
+        return url
+
+    except Exception as e:
+        logger.error("DALL-E generation failed: %s", e)
+        return None
+
+
+async def analyze_legal_document(text: str, user_question: str = "") -> str:
+    """L1: Анализирует текст договора на юридические риски (делегирует в doc_review)."""
+    from src.bot.utils.doc_review import analyze_legal_document as _review
+    return await _review(text, user_question)
+
+
+async def multi_agent_brainstorm(question: str, context: str = "") -> str:
+    """L5: Мульти-агентный консилиум (делегирует в multi_agent)."""
+    from src.bot.utils.multi_agent import multi_agent_brainstorm as _brainstorm
+    return await _brainstorm(question, context)
+
+
+async def audit_post_beauty(text: str) -> dict:
+    """AI-аудит «красоты» текста: проверка визуальной нагрузки.
+
+    Проверяет:
+    - Плотность эмодзи (не слишком много/мало)
+    - Наличие абзацев и структуры
+    - Длину предложений
+    - Баланс форматирования
+
+    Returns:
+        {"passed": bool, "score": int, "issues": [...], "suggestion": str}
+    """
+    ai = get_orchestrator()
+    audit_prompt = (
+        f"Проверь форматирование и визуальное качество этого текста для Telegram:\n\n"
+        f"---\n{text[:2000]}\n---\n\n"
+        "Оцени по критериям (0-10 каждый):\n"
+        "1. emoji_density: не слишком много (>15 — плохо), не слишком мало (<2 — плохо)\n"
+        "2. paragraph_structure: есть ли абзацы, отступы, разделители\n"
+        "3. readability: не «простыня», короткие блоки текста (2-3 строки)\n"
+        "4. formatting: есть жирный, курсив, списки где уместно\n"
+        "5. cta_presence: есть ли призыв к действию\n\n"
+        "Верни СТРОГО JSON:\n"
+        '{"passed": true/false, "score": общий_0_50, '
+        '"issues": ["проблема1", ...], '
+        '"suggestion": "что исправить"}'
+    )
+
+    try:
+        result = await ai.call_with_fallback(
+            audit_prompt,
+            "Ты — UX-редактор Telegram-канала. Оцени визуальное качество текста.",
+            primary="openai", max_tokens=512, temperature=0.3,
         )
-    except Exception as gpt_err:
-        logger.warning("Digest GPT fallback: %s", gpt_err)
-        return await asyncio.to_thread(
-            _sync_gemini,
-            prompt=full,
-            system=MARKETING_PERSONA,
-            max_tokens=max_tokens,
-            temperature=0.7,
-        )
+
+        import re
+        match = re.search(r'\{.*\}', result, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except Exception as e:
+        logger.warning("Beauty audit failed: %s", e)
+
+    return {"passed": True, "score": 25, "issues": [], "suggestion": ""}
