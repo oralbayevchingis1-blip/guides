@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+
+# Google credentials (service account key)
+google_credentials.json
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# Database (local SQLite)
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data directory (runtime data, tokens, guides PDFs)
+data/
+!data/.gitkeep
+
+# Test scripts (local only)
+test_ai_system.py
+test_bot_live.py
+
+# Telegraph token
+telegraph_token.txt
+
+# Embedded repos
+legal-partner-pro-review/
