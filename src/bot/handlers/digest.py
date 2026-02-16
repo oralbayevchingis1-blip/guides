@@ -25,6 +25,32 @@ logger = logging.getLogger(__name__)
 
 ALMATY_TZ = timezone(timedelta(hours=5))
 
+# Module-level refs for scheduled jobs (set by register_scheduled_jobs)
+_bot: Bot | None = None
+_google: GoogleSheetsClient | None = None
+_cache: TTLCache | None = None
+
+
+async def _job_morning_digest() -> None:
+    """APScheduler job: утренний дайджест (module-level for serialization)."""
+    await send_morning_digest(bot=_bot, google=_google, cache=_cache)
+
+
+async def _job_evening_report() -> None:
+    """APScheduler job: вечерний отчёт."""
+    await send_evening_report(bot=_bot, google=_google, cache=_cache)
+
+
+async def _job_auto_faq() -> None:
+    """APScheduler job: auto-FAQ discovery."""
+    from src.bot.utils.auto_faq import run_auto_faq_discovery
+    await run_auto_faq_discovery(google=_google, cache=_cache, bot=_bot)
+
+
+async def _job_content_hunter() -> None:
+    """APScheduler job: проактивный контент-хантер."""
+    await proactive_content_hunter(bot=_bot, google=_google, cache=_cache)
+
 
 def register_scheduled_jobs(
     scheduler,
@@ -34,18 +60,16 @@ def register_scheduled_jobs(
     cache: TTLCache,
 ) -> None:
     """Регистрирует ежедневные задачи в APScheduler."""
-
-    async def _morning_digest():
-        await send_morning_digest(bot=bot, google=google, cache=cache)
-
-    async def _evening_report():
-        await send_evening_report(bot=bot, google=google, cache=cache)
+    global _bot, _google, _cache
+    _bot = bot
+    _google = google
+    _cache = cache
 
     # Утренний дайджест — 09:00 Алматы (04:00 UTC)
     scheduler.add_job(
-        _morning_digest,
+        _job_morning_digest,
         trigger="cron",
-        hour=4, minute=0,  # UTC
+        hour=4, minute=0,
         id="morning_digest",
         replace_existing=True,
         misfire_grace_time=3600,
@@ -53,34 +77,27 @@ def register_scheduled_jobs(
 
     # Вечерний отчёт — 18:00 Алматы (13:00 UTC)
     scheduler.add_job(
-        _evening_report,
+        _job_evening_report,
         trigger="cron",
-        hour=13, minute=0,  # UTC
+        hour=13, minute=0,
         id="evening_report",
         replace_existing=True,
         misfire_grace_time=3600,
     )
 
     # Auto-FAQ Discovery — ежедневно в 02:00 UTC (07:00 Алматы)
-    async def _auto_faq():
-        from src.bot.utils.auto_faq import run_auto_faq_discovery
-        await run_auto_faq_discovery(google=google, cache=cache, bot=bot)
-
     scheduler.add_job(
-        _auto_faq,
+        _job_auto_faq,
         trigger="cron",
-        hour=2, minute=0,  # UTC
+        hour=2, minute=0,
         id="auto_faq_daily",
         replace_existing=True,
         misfire_grace_time=3600,
     )
 
-    # Проактивный контент-хантер — каждые 2 часа ищет критические новости
-    async def _content_hunter():
-        await proactive_content_hunter(bot=bot, google=google, cache=cache)
-
+    # Проактивный контент-хантер — каждые 2 часа
     scheduler.add_job(
-        _content_hunter,
+        _job_content_hunter,
         trigger="interval",
         hours=2,
         id="content_hunter_2h",
