@@ -145,21 +145,33 @@ class GoogleSheetsClient:
         credentials_json: Optional[str] = None,
         credentials_base64: Optional[str] = None,
     ) -> None:
-        if credentials_json:
+        import os
+        import tempfile
+
+        if credentials_json and not os.path.exists(credentials_path):
             info = _json.loads(credentials_json)
-            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-            logger.info("Google credentials loaded from JSON env variable")
-        elif credentials_base64:
-            padded = credentials_base64 + "=" * (-len(credentials_base64) % 4)
-            info = _json.loads(base64.b64decode(padded))
-            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-            logger.info("Google credentials loaded from base64 env variable")
-        else:
-            creds = Credentials.from_service_account_file(
-                credentials_path,
-                scopes=SCOPES,
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, dir="/tmp"
+            ) as f:
+                _json.dump(info, f)
+                credentials_path = f.name
+            logger.info("Google credentials written to temp file from JSON env var")
+        elif credentials_base64 and not os.path.exists(credentials_path):
+            raw = base64.b64decode(
+                credentials_base64 + "=" * (-len(credentials_base64) % 4)
             )
-            logger.info("Google credentials loaded from file: %s", credentials_path)
+            with tempfile.NamedTemporaryFile(
+                mode="wb", suffix=".json", delete=False, dir="/tmp"
+            ) as f:
+                f.write(raw)
+                credentials_path = f.name
+            logger.info("Google credentials written to temp file from base64 env var")
+
+        creds = Credentials.from_service_account_file(
+            credentials_path,
+            scopes=SCOPES,
+        )
+        logger.info("Google credentials loaded from file: %s", credentials_path)
         self._creds = creds
         self.gc = gspread.authorize(creds)
         self.spreadsheet_id = spreadsheet_id
