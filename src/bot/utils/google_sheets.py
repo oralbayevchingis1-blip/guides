@@ -133,7 +133,8 @@ class GoogleSheetsClient:
     Args:
         credentials_path: Путь к JSON-файлу сервисного аккаунта.
         spreadsheet_id: ID Google-таблицы из URL.
-        credentials_base64: base64-encoded JSON credentials (альтернатива файлу).
+        credentials_json: Raw JSON string credentials (recommended for Railway).
+        credentials_base64: base64-encoded JSON credentials (alternative).
     """
 
     def __init__(
@@ -141,10 +142,16 @@ class GoogleSheetsClient:
         credentials_path: str,
         spreadsheet_id: str,
         *,
+        credentials_json: Optional[str] = None,
         credentials_base64: Optional[str] = None,
     ) -> None:
-        if credentials_base64:
-            info = _json.loads(base64.b64decode(credentials_base64))
+        if credentials_json:
+            info = _json.loads(credentials_json)
+            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+            logger.info("Google credentials loaded from JSON env variable")
+        elif credentials_base64:
+            padded = credentials_base64 + "=" * (-len(credentials_base64) % 4)
+            info = _json.loads(base64.b64decode(padded))
             creds = Credentials.from_service_account_info(info, scopes=SCOPES)
             logger.info("Google credentials loaded from base64 env variable")
         else:

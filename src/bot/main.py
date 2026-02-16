@@ -138,6 +138,7 @@ async def main() -> None:
     google = GoogleSheetsClient(
         credentials_path=settings.GOOGLE_CREDENTIALS_PATH,
         spreadsheet_id=settings.GOOGLE_SPREADSHEET_ID,
+        credentials_json=settings.GOOGLE_CREDENTIALS_JSON,
         credentials_base64=settings.GOOGLE_CREDENTIALS_BASE64,
     )
     cache = TTLCache(ttl_seconds=settings.CACHE_TTL_SECONDS)
