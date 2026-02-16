@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     # AI
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    AI_ENABLED: bool = True
+
+    # Telegraph (Instant View)
+    TELEGRAPH_ACCESS_TOKEN: str = ""
+
+    # Digest / Team
+    TEAM_CHAT_ID: int = 0
+    DIGEST_HOUR: int = 9
+    DIGEST_ENABLED: bool = True
 
     # Privacy
     PRIVACY_POLICY_URL: str = "https://www.solispartners.kz/privacy"

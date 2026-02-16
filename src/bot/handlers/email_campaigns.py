@@ -1,0 +1,668 @@
+"""Email-ретаргетинг — персонализированные рассылки по сегментам.
+
+Команды:
+    /email_campaign — интерактивный конструктор кампании
+
+Сегменты строятся по скачанным гайдам → интересы (теги).
+В письме: персонализированная рекомендация + UTM deep link.
+"""
+
+import asyncio
+import html
+import logging
+from collections import defaultdict
+from datetime import datetime, timezone
+
+from aiogram import Bot, F, Router
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+from src.bot.utils.cache import TTLCache
+from src.bot.utils.google_sheets import GoogleSheetsClient
+from src.config import settings
+
+router = Router()
+logger = logging.getLogger(__name__)
+
+
+# ── Маппинг guide_id → тематические теги ────────────────────────────────
+
+GUIDE_INTEREST_MAP: dict[str, list[str]] = {
+    "too": ["corporate", "registration", "business"],
+    "ip": ["startup", "registration", "business"],
+    "mfca": ["aifc", "international", "finance"],
+    "aifc": ["aifc", "international", "finance"],
+    "esop": ["startup", "corporate", "finance"],
+    "taxes": ["tax", "finance", "business"],
+    "labor": ["labor", "hr", "business"],
+    "it_law": ["it", "tech", "ip"],
+    "ma": ["corporate", "finance", "m&a"],
+    "invest": ["investment", "finance", "international"],
+}
+
+ALL_SEGMENTS = sorted({tag for tags in GUIDE_INTEREST_MAP.values() for tag in tags})
+
+# ── Обратный маппинг: тег → guide_ids ────────────────────────────────────
+
+TAG_TO_GUIDES: dict[str, list[str]] = defaultdict(list)
+for _gid, _tags in GUIDE_INTEREST_MAP.items():
+    for _tag in _tags:
+        TAG_TO_GUIDES[_tag].append(_gid)
+
+
+def _is_admin(uid: int | None) -> bool:
+    return uid == settings.ADMIN_ID
+
+
+def _esc(text: str) -> str:
+    return html.escape(str(text))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Сегментация
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _get_user_interests(leads: list[dict], user_id: int) -> set[str]:
+    """Определяет интересы пользователя по скачанным гайдам."""
+    interests: set[str] = set()
+    for lead in leads:
+        if str(lead.get("user_id", "")) == str(user_id):
+            guide = str(lead.get("guide", lead.get("selected_guide", ""))).lower()
+            for key, tags in GUIDE_INTEREST_MAP.items():
+                if key in guide:
+                    interests.update(tags)
+    return interests
+
+
+def _get_user_guides(leads: list[dict], user_id: int) -> set[str]:
+    """Возвращает set guide_id, скачанных пользователем."""
+    guides: set[str] = set()
+    for lead in leads:
+        if str(lead.get("user_id", "")) == str(user_id):
+            g = str(lead.get("guide", lead.get("selected_guide", ""))).strip()
+            if g:
+                guides.add(g)
+    return guides
+
+
+def _build_audience(
+    leads: list[dict],
+    target_tags: list[str] | None = None,
+    warmth_filter: str | None = None,
+) -> list[dict]:
+    """Строит сегментированную аудиторию.
+
+    Returns:
+        Список уникальных записей: {user_id, email, name, interests, warmth, guides}
+    """
+    target_set = {t.lower() for t in target_tags} if target_tags else None
+
+    seen_emails: set[str] = set()
+    audience: list[dict] = []
+
+    # Группируем по user_id
+    user_data: dict[int, dict] = {}
+    for lead in leads:
+        uid_str = str(lead.get("user_id", "")).strip()
+        if not uid_str:
+            continue
+        uid = int(uid_str)
+        email = str(lead.get("email", "")).strip().lower()
+        name = str(lead.get("name", "")).strip()
+        warmth = str(lead.get("warmth", "Cold")).strip()
+
+        if uid not in user_data:
+            user_data[uid] = {
+                "user_id": uid,
+                "email": email,
+                "name": name,
+                "warmth": warmth,
+                "guides": set(),
+                "interests": set(),
+            }
+        elif email and not user_data[uid]["email"]:
+            user_data[uid]["email"] = email
+
+        guide = str(lead.get("guide", lead.get("selected_guide", ""))).strip()
+        if guide:
+            user_data[uid]["guides"].add(guide)
+            for key, tags in GUIDE_INTEREST_MAP.items():
+                if key in guide.lower():
+                    user_data[uid]["interests"].update(tags)
+
+    for ud in user_data.values():
+        email = ud["email"]
+        if not email or email in seen_emails:
+            continue
+
+        if warmth_filter and ud["warmth"].lower() != warmth_filter.lower():
+            continue
+
+        if target_set and not (ud["interests"] & target_set):
+            continue
+
+        seen_emails.add(email)
+        audience.append({
+            "user_id": ud["user_id"],
+            "email": email,
+            "name": ud["name"],
+            "warmth": ud["warmth"],
+            "guides": ud["guides"],
+            "interests": ud["interests"],
+        })
+
+    return audience
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Email-шаблон для ретаргетинга
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def build_retarget_email(
+    name: str,
+    guide: dict,
+    bot_username: str,
+    *,
+    campaign_id: str = "",
+) -> tuple[str, str]:
+    """Генерирует HTML-письмо с рекомендацией гайда.
+
+    Returns:
+        (subject, html_body)
+    """
+    guide_title = guide.get("title", "")
+    guide_desc = guide.get("description", "")
+    guide_id = guide.get("id", "")
+    preview = guide.get("preview_text", "") or guide.get("preview", "")
+    highlights = guide.get("highlights", "")
+    pages = str(guide.get("pages", "")).strip()
+
+    utm = f"--src_email--cmp_{campaign_id}" if campaign_id else "--email"
+    deep_link = f"https://t.me/{bot_username}?start=guide_{guide_id}{utm}"
+
+    # Highlights → bullets
+    bullets_html = ""
+    if highlights:
+        items = [h.strip() for h in highlights.replace("\n", ";").split(";") if h.strip()]
+        if items:
+            bullets_html = "<ul style='margin:12px 0;padding-left:20px;'>"
+            for item in items[:5]:
+                bullets_html += f"<li style='margin:4px 0;'>{_esc(item)}</li>"
+            bullets_html += "</ul>"
+
+    meta_parts = []
+    if pages:
+        meta_parts.append(f"{_esc(pages)} страниц")
+    meta_parts.extend(["PDF", "бесплатно"])
+    meta_line = " · ".join(meta_parts)
+
+    subject = f"{name}, новый гайд для вас: «{guide_title}»"
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
+        <div style="background:#1a237e;padding:20px;text-align:center;">
+            <h1 style="color:#c9a227;margin:0;font-size:22px;">SOLIS Partners</h1>
+            <p style="color:#fff;margin:5px 0 0;font-size:13px;">Юридическая фирма нового поколения</p>
+        </div>
+
+        <div style="padding:30px;">
+            <p style="font-size:16px;color:#333;">Здравствуйте, <b>{_esc(name)}</b>!</p>
+
+            <p style="color:#555;">На основе ваших интересов мы подобрали новый материал,
+            который может быть полезен для вашего бизнеса:</p>
+
+            <div style="background:#f8f9fa;border-left:4px solid #2563eb;padding:20px;
+                        margin:20px 0;border-radius:8px;">
+                <h2 style="margin:0 0 8px;font-size:18px;color:#1a237e;">
+                    📚 {_esc(guide_title)}</h2>
+                {'<p style="margin:0 0 12px;color:#555;">' + _esc(guide_desc) + '</p>' if guide_desc else ''}
+                {bullets_html}
+                {'<p style="margin:0 0 12px;color:#555;"><b>Что внутри:</b> ' + _esc(preview) + '</p>' if preview and not bullets_html else ''}
+                <p style="margin:0 0 16px;font-size:13px;color:#888;">📎 {meta_line}</p>
+                <a href="{_esc(deep_link)}"
+                   style="display:inline-block;background:#2563eb;color:#fff;
+                          padding:12px 28px;border-radius:6px;text-decoration:none;
+                          font-weight:bold;font-size:15px;">
+                    📥 Скачать бесплатно
+                </a>
+            </div>
+
+            <p style="color:#888;font-size:13px;margin-top:24px;">
+                Гайд откроется в Telegram-боте SOLIS Partners — там же можно
+                задать вопрос AI-юристу или записаться на бесплатную консультацию.
+            </p>
+        </div>
+
+        <div style="padding:15px;text-align:center;background:#f5f5f5;
+                    border-top:1px solid #eee;">
+            <p style="color:#999;font-size:12px;margin:0;">
+                © SOLIS Partners ·
+                <a href="https://solispartners.kz" style="color:#999;">solispartners.kz</a>
+            </p>
+            <p style="color:#bbb;font-size:11px;margin:5px 0 0;">
+                Вы получили это письмо, потому что скачивали гайды через нашего бота.
+                <a href="https://t.me/{_esc(bot_username)}?start=unsubscribe"
+                   style="color:#bbb;">Отписаться</a>
+            </p>
+        </div>
+    </div>
+    """
+
+    return subject, html_body
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /email_campaign — конструктор кампании
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class CampaignStates(StatesGroup):
+    choose_segment = State()
+    choose_guide = State()
+    confirm = State()
+
+
+@router.message(Command("email_campaign"))
+async def cmd_email_campaign(
+    message: Message,
+    state: FSMContext,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Запуск интерактивного конструктора email-кампании."""
+    if not _is_admin(message.from_user and message.from_user.id):
+        return
+
+    from src.bot.utils.email_sender import is_email_configured
+    if not is_email_configured():
+        await message.answer(
+            "❌ Email не настроен.\n\n"
+            "Добавьте в <code>.env</code>:\n"
+            "<code>RESEND_API_KEY=re_...</code>\n"
+            "или SMTP-параметры (SMTP_HOST, SMTP_USER, SMTP_PASSWORD)."
+        )
+        return
+
+    await state.clear()
+
+    # Загружаем лидов и считаем сегменты
+    leads = await google.get_recent_leads(limit=5000)
+    audience_all = _build_audience(leads)
+
+    if not audience_all:
+        await message.answer("📧 Нет лидов с email для рассылки.")
+        return
+
+    # Считаем размер каждого сегмента
+    segment_counts: dict[str, int] = {}
+    for tag in ALL_SEGMENTS:
+        seg = _build_audience(leads, target_tags=[tag])
+        if seg:
+            segment_counts[tag] = len(seg)
+
+    lines = [
+        f"📧 <b>Email-кампания</b>\n",
+        f"👥 Всего лидов с email: <b>{len(audience_all)}</b>\n",
+        "🎯 <b>Выберите сегмент:</b>",
+    ]
+
+    buttons = []
+    for tag in sorted(segment_counts, key=lambda t: -segment_counts[t]):
+        cnt = segment_counts[tag]
+        cb = f"ecamp_seg_{tag}"
+        buttons.append([InlineKeyboardButton(
+            text=f"#{tag} ({cnt} чел.)",
+            callback_data=cb,
+        )])
+
+    buttons.append([InlineKeyboardButton(
+        text=f"📨 Все ({len(audience_all)} чел.)",
+        callback_data="ecamp_seg_all",
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="🔥 Только Hot",
+        callback_data="ecamp_seg_hot",
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="❌ Отмена",
+        callback_data="ecamp_cancel",
+    )])
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await state.set_state(CampaignStates.choose_segment)
+
+
+@router.callback_query(F.data.startswith("ecamp_seg_"), CampaignStates.choose_segment)
+async def campaign_segment_chosen(
+    callback: CallbackQuery,
+    state: FSMContext,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Сегмент выбран → показываем выбор гайда для рекомендации."""
+    if not _is_admin(callback.from_user.id):
+        return
+    await callback.answer()
+
+    segment = callback.data.removeprefix("ecamp_seg_")
+
+    # Считаем аудиторию
+    leads = await google.get_recent_leads(limit=5000)
+    if segment == "all":
+        audience = _build_audience(leads)
+        seg_label = "Все"
+    elif segment == "hot":
+        audience = _build_audience(leads, warmth_filter="Hot")
+        seg_label = "Hot"
+    else:
+        audience = _build_audience(leads, target_tags=[segment])
+        seg_label = f"#{segment}"
+
+    if not audience:
+        await callback.message.edit_text(
+            f"📧 Сегмент «{seg_label}» пуст — нет лидов с email."
+        )
+        await state.clear()
+        return
+
+    await state.update_data(
+        campaign_segment=segment,
+        campaign_seg_label=seg_label,
+        campaign_audience_count=len(audience),
+    )
+
+    # Показываем гайды для рекомендации
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    buttons = []
+    for g in catalog:
+        gid = g.get("id", "")
+        title = g.get("title", gid)[:35]
+        cb = f"ecamp_guide_{gid}"
+        if len(cb.encode("utf-8")) > 64:
+            cb = cb[:64]
+        buttons.append([InlineKeyboardButton(text=f"📚 {title}", callback_data=cb)])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="ecamp_cancel")])
+
+    await callback.message.edit_text(
+        f"📧 <b>Сегмент:</b> {seg_label} ({len(audience)} чел.)\n\n"
+        "📚 <b>Какой гайд рекомендовать в письме?</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await state.set_state(CampaignStates.choose_guide)
+
+
+@router.callback_query(F.data.startswith("ecamp_guide_"), CampaignStates.choose_guide)
+async def campaign_guide_chosen(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Гайд выбран → показываем превью письма и подтверждение."""
+    if not _is_admin(callback.from_user.id):
+        return
+    await callback.answer()
+
+    guide_id = callback.data.removeprefix("ecamp_guide_")
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+
+    guide = None
+    for g in catalog:
+        if str(g.get("id", "")) == guide_id:
+            guide = g
+            break
+
+    if not guide:
+        await callback.message.edit_text("❌ Гайд не найден.")
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    seg_label = data.get("campaign_seg_label", "?")
+    audience_count = data.get("campaign_audience_count", 0)
+
+    # Генерируем campaign_id
+    campaign_id = f"retarget_{guide_id}_{datetime.now(timezone.utc).strftime('%d%m')}"
+
+    await state.update_data(
+        campaign_guide_id=guide_id,
+        campaign_id=campaign_id,
+    )
+
+    bot_info = await bot.get_me()
+
+    # Превью письма
+    subject, _ = build_retarget_email(
+        name="Айдар",
+        guide=guide,
+        bot_username=bot_info.username,
+        campaign_id=campaign_id,
+    )
+
+    guide_title = guide.get("title", guide_id)
+
+    await callback.message.edit_text(
+        f"📧 <b>Превью email-кампании</b>\n\n"
+        f"🎯 Сегмент: <b>{seg_label}</b>\n"
+        f"👥 Получателей: <b>{audience_count}</b>\n"
+        f"📚 Гайд: <b>{_esc(guide_title)}</b>\n"
+        f"📝 Тема: <i>{_esc(subject)}</i>\n"
+        f"🆔 Campaign: <code>{campaign_id}</code>\n\n"
+        f"UTM в ссылке: <code>src_email, cmp_{campaign_id}</code>\n\n"
+        "Отправить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Отправить", callback_data="ecamp_send"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="ecamp_cancel"),
+            ],
+            [InlineKeyboardButton(
+                text="👁 Тестовое письмо (себе)",
+                callback_data="ecamp_test",
+            )],
+        ]),
+    )
+    await state.set_state(CampaignStates.confirm)
+
+
+@router.callback_query(F.data == "ecamp_test", CampaignStates.confirm)
+async def campaign_test_email(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Отправляет тестовое письмо админу."""
+    if not _is_admin(callback.from_user.id):
+        return
+    await callback.answer("Отправляю тестовое письмо...")
+
+    data = await state.get_data()
+    guide_id = data.get("campaign_guide_id", "")
+    campaign_id = data.get("campaign_id", "")
+
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    guide = next((g for g in catalog if str(g.get("id", "")) == guide_id), None)
+    if not guide:
+        await callback.message.answer("❌ Гайд не найден.")
+        return
+
+    bot_info = await bot.get_me()
+
+    # Получаем email админа из лидов
+    from src.database.crud import get_lead_by_user_id
+    admin_lead = await get_lead_by_user_id(settings.ADMIN_ID)
+    if not admin_lead or not admin_lead.email:
+        await callback.message.answer(
+            "❌ Не найден email админа в БД. "
+            "Сначала пройдите lead form в боте."
+        )
+        return
+
+    subject, html_body = build_retarget_email(
+        name=admin_lead.name or "Admin",
+        guide=guide,
+        bot_username=bot_info.username,
+        campaign_id=f"test_{campaign_id}",
+    )
+
+    from src.bot.utils.email_sender import send_email
+    ok = await send_email(admin_lead.email, f"[TEST] {subject}", html_body)
+
+    if ok:
+        await callback.message.answer(
+            f"✅ Тестовое письмо отправлено на <code>{admin_lead.email}</code>"
+        )
+    else:
+        await callback.message.answer("❌ Ошибка отправки. Проверьте логи.")
+
+
+@router.callback_query(F.data == "ecamp_send", CampaignStates.confirm)
+async def campaign_send(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Отправка email-кампании всем пользователям сегмента."""
+    if not _is_admin(callback.from_user.id):
+        return
+    await callback.answer()
+
+    data = await state.get_data()
+    segment = data.get("campaign_segment", "all")
+    guide_id = data.get("campaign_guide_id", "")
+    campaign_id = data.get("campaign_id", "")
+    await state.clear()
+
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    guide = next((g for g in catalog if str(g.get("id", "")) == guide_id), None)
+    if not guide:
+        await callback.message.edit_text("❌ Гайд не найден.")
+        return
+
+    # Строим аудиторию
+    leads = await google.get_recent_leads(limit=5000)
+    if segment == "all":
+        audience = _build_audience(leads)
+    elif segment == "hot":
+        audience = _build_audience(leads, warmth_filter="Hot")
+    else:
+        audience = _build_audience(leads, target_tags=[segment])
+
+    if not audience:
+        await callback.message.edit_text("📧 Аудитория пуста.")
+        return
+
+    bot_info = await bot.get_me()
+    total = len(audience)
+    sent = 0
+    failed = 0
+
+    status_msg = await callback.message.edit_text(
+        f"⏳ Email-кампания запущена: 0/{total}..."
+    )
+
+    from src.bot.utils.email_sender import send_email
+
+    for i, user in enumerate(audience, 1):
+        email = user["email"]
+        name = user.get("name") or "Коллега"
+
+        # Пропускаем, если пользователь уже скачал этот гайд
+        if guide_id in user.get("guides", set()):
+            total -= 1
+            continue
+
+        subject, html_body = build_retarget_email(
+            name=name,
+            guide=guide,
+            bot_username=bot_info.username,
+            campaign_id=campaign_id,
+        )
+
+        try:
+            ok = await send_email(email, subject, html_body)
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            logger.warning("Email campaign send failed for %s: %s", email[:20], e)
+
+        # Прогресс
+        if i % 5 == 0 or i == len(audience):
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Email-кампания: {i}/{total}\n"
+                    f"✅ Отправлено: {sent}\n"
+                    f"❌ Ошибок: {failed}"
+                )
+            except Exception:
+                pass
+
+        # Rate limit (Resend: 10/sec, SMTP: varies)
+        await asyncio.sleep(0.15)
+
+    # Лог кампании
+    campaign_log = {
+        "campaign_id": campaign_id,
+        "segment": segment,
+        "guide_id": guide_id,
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    logger.info("Email campaign completed: %s", campaign_log)
+
+    # Пишем лог в Sheets
+    try:
+        await google.log_email_campaign(
+            campaign_id=campaign_id,
+            segment=segment,
+            guide_id=guide_id,
+            total=total,
+            sent=sent,
+            failed=failed,
+        )
+    except Exception as e:
+        logger.warning("Failed to log campaign to Sheets: %s", e)
+
+    await status_msg.edit_text(
+        f"✅ <b>Email-кампания завершена!</b>\n\n"
+        f"🆔 {campaign_id}\n"
+        f"📊 Всего: {total}\n"
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}\n\n"
+        f"UTM: <code>src_email / cmp_{campaign_id}</code>\n"
+        "Отслеживайте переходы через /sources"
+    )
+
+
+@router.callback_query(F.data == "ecamp_cancel")
+async def campaign_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    await callback.message.edit_text("❌ Кампания отменена.")
+    await callback.answer()
+
+
+    # /export_audience находится в admin.py

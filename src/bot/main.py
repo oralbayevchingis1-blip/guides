@@ -17,9 +17,11 @@ from src.bot.handlers import (
     broadcast,
     cabinet,
     consult,
+    consultation,
     content_manager,
     corporate,
     documents,
+    email_campaigns,
     feedback,
     group_mode,
     language,
@@ -27,6 +29,7 @@ from src.bot.handlers import (
     legal_tools,
     live_support,
     payments,
+    questions,
     referral,
     start,
     subscription,
@@ -378,6 +381,9 @@ async def main() -> None:
     dp.include_router(language.router)         # /lang выбор языка
     dp.include_router(timezone_handler.router) # /timezone + геолокация
     dp.include_router(waitlist_handler.router) # waitlist Coming Soon
+    dp.include_router(consultation.router)     # запись на консультацию
+    dp.include_router(questions.router)        # вопросы юристу
+    dp.include_router(email_campaigns.router)  # email-ретаргетинг
     dp.include_router(subscription.router)     # подписка колбеки
     dp.include_router(feedback.router)         # NPS/feedback колбеки
     dp.include_router(group_mode.router)       # мониторинг групп

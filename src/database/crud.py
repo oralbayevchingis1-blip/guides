@@ -1,18 +1,64 @@
-"""CRUD-операции с базой данных."""
+"""CRUD-операции с базой данных.
 
+Все публичные функции возвращают Pydantic-схемы (detached-safe DTO).
+"""
+
+import json
 import logging
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-from sqlalchemy import select
-
+from pydantic import BaseModel
+from sqlalchemy import select, update
 from sqlalchemy import func as sa_func
 
-from src.database.models import (
-    ConsentLog, FeedbackScore, Lead, PendingSheetsWrite,
-    Referral, User, WaitlistEntry, async_session,
-)
+from src.database.models import ConsentLog, FunnelEvent, Lead, Question, ScheduledTask, TopicSubscription, User, async_session
 
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PYDANTIC SCHEMAS
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class UserDTO(BaseModel):
+    id: int
+    user_id: int
+    username: Optional[str] = None
+    full_name: Optional[str] = None
+    is_subscribed: bool = False
+    traffic_source: Optional[str] = None
+    business_sphere: Optional[str] = None
+    company_size: Optional[str] = None
+    company_stage: Optional[str] = None
+    bot_blocked: bool = False
+    last_activity: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class LeadDTO(BaseModel):
+    id: int
+    user_id: int
+    email: str
+    name: str
+    selected_guide: str
+    business_sphere: Optional[str] = None
+    traffic_source: Optional[str] = None
+    consent_given: bool = True
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+def _to_user_dto(user: User) -> UserDTO:
+    return UserDTO.model_validate(user)
+
+
+def _to_lead_dto(lead: Lead) -> LeadDTO:
+    return LeadDTO.model_validate(lead)
 
 
 # ──────────────────────── Users ─────────────────────────────────────────
@@ -21,17 +67,9 @@ async def get_or_create_user(
     user_id: int,
     username: str | None = None,
     full_name: str | None = None,
-) -> User:
-    """Получает пользователя из БД или создаёт нового.
-
-    Args:
-        user_id: Telegram ID пользователя.
-        username: Username в Telegram.
-        full_name: Полное имя пользователя.
-
-    Returns:
-        Экземпляр User.
-    """
+    traffic_source: str | None = None,
+) -> UserDTO:
+    """Получает пользователя из БД или создаёт нового."""
     async with async_session() as session:
         stmt = select(User).where(User.user_id == user_id)
         result = await session.execute(stmt)
@@ -42,13 +80,13 @@ async def get_or_create_user(
                 user_id=user_id,
                 username=username,
                 full_name=full_name,
+                traffic_source=traffic_source or None,
             )
             session.add(user)
             await session.commit()
             await session.refresh(user)
-            logger.info("Новый пользователь создан: user_id=%s", user_id)
+            logger.info("Новый пользователь: user_id=%s, src=%s", user_id, traffic_source)
         else:
-            # Обновляем данные если изменились
             changed = False
             if username and user.username != username:
                 user.username = username
@@ -56,17 +94,37 @@ async def get_or_create_user(
             if full_name and user.full_name != full_name:
                 user.full_name = full_name
                 changed = True
+            if traffic_source and not user.traffic_source:
+                user.traffic_source = traffic_source
+                changed = True
             if changed:
                 await session.commit()
-                logger.info("Пользователь обновлён: user_id=%s", user_id)
 
-        return user
+        return _to_user_dto(user)
+
+
+async def get_traffic_source_stats() -> list[tuple[str, int]]:
+    """Возвращает статистику по источникам трафика.
+
+    Returns:
+        Список (source, count) пар, отсортированный по убыванию count.
+    """
+    async with async_session() as session:
+        stmt = (
+            select(
+                User.traffic_source,
+                sa_func.count().label("cnt"),
+            )
+            .where(User.traffic_source.isnot(None), User.traffic_source != "")
+            .group_by(User.traffic_source)
+            .order_by(sa_func.count().desc())
+        )
+        result = await session.execute(stmt)
+        return [(row[0], row[1]) for row in result.all()]
 
 
 async def update_user_activity(user_id: int) -> None:
-    """Обновляет last_activity для трекинга последнего взаимодействия."""
-    from datetime import datetime, timezone
-
+    """Обновляет last_activity."""
     async with async_session() as session:
         stmt = select(User).where(User.user_id == user_id)
         result = await session.execute(stmt)
@@ -76,6 +134,14 @@ async def update_user_activity(user_id: int) -> None:
             await session.commit()
 
 
+async def get_all_user_ids() -> list[int]:
+    """Все user_id (для broadcast)."""
+    async with async_session() as session:
+        stmt = select(User.user_id)
+        result = await session.execute(stmt)
+        return [row[0] for row in result.all()]
+
+
 # ──────────────────────── Leads ─────────────────────────────────────────
 
 async def save_lead(
@@ -83,49 +149,119 @@ async def save_lead(
     email: str,
     name: str,
     selected_guide: str,
-) -> Lead:
-    """Сохраняет нового лида в базу данных.
-
-    Args:
-        user_id: Telegram ID пользователя.
-        email: Email пользователя.
-        name: Имя пользователя.
-        selected_guide: ID выбранного гайда.
-
-    Returns:
-        Экземпляр Lead.
-    """
+    traffic_source: str | None = None,
+) -> LeadDTO:
+    """Сохраняет нового лида с источником трафика."""
     async with async_session() as session:
         lead = Lead(
             user_id=user_id,
             email=email,
             name=name,
             selected_guide=selected_guide,
+            traffic_source=traffic_source or None,
             consent_given=True,
         )
         session.add(lead)
         await session.commit()
         await session.refresh(lead)
-        logger.info("Лид сохранён: user_id=%s, email=%s", user_id, email)
-        return lead
+        logger.info("Лид сохранён: user_id=%s, email=%s, src=%s", user_id, email, traffic_source)
+        return _to_lead_dto(lead)
 
 
-async def get_leads_by_user(user_id: int) -> list[Lead]:
-    """Получает все лиды пользователя."""
+async def get_lead_by_user_id(user_id: int) -> LeadDTO | None:
+    """Последний лид пользователя (для пропуска повторной формы)."""
     async with async_session() as session:
-        stmt = select(Lead).where(Lead.user_id == user_id)
+        stmt = (
+            select(Lead)
+            .where(Lead.user_id == user_id)
+            .order_by(Lead.id.desc())
+            .limit(1)
+        )
         result = await session.execute(stmt)
-        return list(result.scalars().all())
+        lead = result.scalar_one_or_none()
+        return _to_lead_dto(lead) if lead else None
 
 
-async def get_lead_by_user_id(user_id: int) -> Lead | None:
-    """Получает последний лид пользователя (для пропуска формы повторных пользователей).
+async def get_user_downloaded_guides(user_id: int) -> list[str]:
+    """Уникальные guide_id, которые скачал пользователь."""
+    async with async_session() as session:
+        stmt = (
+            select(Lead.selected_guide)
+            .where(Lead.user_id == user_id)
+            .distinct()
+        )
+        result = await session.execute(stmt)
+        return [row[0] for row in result.all() if row[0]]
 
-    Args:
-        user_id: Telegram ID пользователя.
+
+async def count_user_downloads(user_id: int) -> int:
+    """Количество уникальных скачанных гайдов."""
+    async with async_session() as session:
+        stmt = (
+            select(sa_func.count(Lead.selected_guide.distinct()))
+            .where(Lead.user_id == user_id)
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one() or 0
+
+
+async def count_guide_downloads(guide_id: str) -> int:
+    """Количество скачиваний конкретного гайда (всего пользователей)."""
+    async with async_session() as session:
+        stmt = (
+            select(sa_func.count(Lead.user_id.distinct()))
+            .where(Lead.selected_guide == guide_id)
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one() or 0
+
+
+async def count_guide_downloads_bulk(guide_ids: list[str]) -> dict[str, int]:
+    """Количество скачиваний нескольких гайдов за один запрос.
 
     Returns:
-        Последний Lead или None, если пользователь ещё не заполнял форму.
+        Словарь {guide_id: count}.
+    """
+    if not guide_ids:
+        return {}
+    async with async_session() as session:
+        stmt = (
+            select(Lead.selected_guide, sa_func.count(Lead.user_id.distinct()))
+            .where(Lead.selected_guide.in_(guide_ids))
+            .group_by(Lead.selected_guide)
+        )
+        result = await session.execute(stmt)
+        return {row[0]: row[1] for row in result.all()}
+
+
+async def count_consultations_this_month() -> int:
+    """Количество записей на консультацию за текущий месяц."""
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    async with async_session() as session:
+        stmt = (
+            select(sa_func.count())
+            .select_from(Lead)
+            .where(
+                Lead.selected_guide == "__consultation__",
+                Lead.created_at >= month_start,
+            )
+        )
+        result = await session.execute(stmt)
+        count = result.scalar_one() or 0
+
+    # Если нет специальных записей, считаем по ScheduledTask с типом followup,
+    # у которых payload содержит guide_id — это косвенный показатель активности.
+    # Но точнее — считаем через консультации, если Google Sheets не доступен.
+    return count
+
+
+async def update_lead_sphere(user_id: int, sphere: str) -> bool:
+    """Обновляет business_sphere у последнего лида пользователя.
+
+    Returns:
+        True если обновлено, False если лид не найден.
     """
     async with async_session() as session:
         stmt = (
@@ -135,213 +271,643 @@ async def get_lead_by_user_id(user_id: int) -> Lead | None:
             .limit(1)
         )
         result = await session.execute(stmt)
-        return result.scalar_one_or_none()
+        lead = result.scalar_one_or_none()
+        if lead:
+            lead.business_sphere = sphere[:255]
+            await session.commit()
+            logger.info("Business sphere updated: user=%s sphere='%s'", user_id, sphere[:50])
+            return True
+        return False
 
 
-async def get_all_user_ids() -> list[int]:
-    """Получает все user_id из таблицы пользователей (для broadcast)."""
+async def delete_leads_for_user(user_id: int) -> int:
+    """Удаляет все лиды пользователя. Возвращает количество удалённых."""
+    from sqlalchemy import delete
     async with async_session() as session:
-        stmt = select(User.user_id)
+        stmt = delete(Lead).where(Lead.user_id == user_id)
         result = await session.execute(stmt)
-        return [row[0] for row in result.all()]
-
-
-# ──────────────────────── Referrals ─────────────────────────────────────
-
-async def save_referral(referrer_id: int, referred_id: int) -> bool:
-    """Сохраняет реферальную связку.
-
-    Args:
-        referrer_id: User ID реферера.
-        referred_id: User ID нового пользователя.
-
-    Returns:
-        True если связка создана, False если уже существует.
-    """
-    async with async_session() as session:
-        # Проверяем, не был ли уже этот пользователь зарегистрирован как реферал
-        existing = await session.execute(
-            select(Referral).where(Referral.referred_id == referred_id)
-        )
-        if existing.scalar_one_or_none():
-            return False
-
-        # Не позволяем самореферал
-        if referrer_id == referred_id:
-            return False
-
-        referral = Referral(referrer_id=referrer_id, referred_id=referred_id)
-        session.add(referral)
         await session.commit()
-        logger.info("Реферал сохранён: %s -> %s", referrer_id, referred_id)
-        return True
+        count = result.rowcount
+        logger.info("Удалено %d лидов для user_id=%s", count, user_id)
+        return count
 
 
-async def count_referrals(user_id: int) -> int:
-    """Считает количество рефералов пользователя."""
+async def delete_user(user_id: int) -> bool:
+    """Удаляет пользователя из таблицы users."""
+    from sqlalchemy import delete
     async with async_session() as session:
-        result = await session.execute(
-            select(sa_func.count(Referral.id)).where(
-                Referral.referrer_id == user_id
-            )
-        )
-        return result.scalar() or 0
+        stmt = delete(User).where(User.user_id == user_id)
+        result = await session.execute(stmt)
+        await session.commit()
+        return result.rowcount > 0
 
 
 # ──────────────────────── Consent Logs ──────────────────────────────────
 
-async def save_consent_log(log_entry: dict[str, Any]) -> ConsentLog:
-    """Сохраняет запись согласия в базу данных.
-
-    Args:
-        log_entry: Словарь с данными согласия.
-
-    Returns:
-        Экземпляр ConsentLog.
-    """
-    from datetime import datetime, timezone
-
+async def save_consent_log(log_entry: dict) -> ConsentLog:
+    """Сохраняет запись согласия."""
     async with async_session() as session:
-        # timestamp может быть строкой (legacy) или datetime
-        ts = log_entry.get("timestamp")
-        if isinstance(ts, str):
-            ts = datetime.now(timezone.utc)
         consent = ConsentLog(
             user_id=log_entry["user_id"],
             consent_type=log_entry["consent_type"],
-            timestamp=ts,
-            ip_address=log_entry.get("ip_address"),
-            user_agent=log_entry.get("user_agent"),
         )
         session.add(consent)
         await session.commit()
         await session.refresh(consent)
-        logger.info("Согласие записано: user_id=%s", log_entry["user_id"])
+        logger.info("Согласие: user_id=%s", log_entry["user_id"])
         return consent
 
 
-# ──────────────────────── Referral Milestones ────────────────────────────
-
-async def check_referral_reward(referrer_id: int) -> str | None:
-    """Проверяет, достигнут ли реферальный milestone.
-
-    Returns:
-        Идентификатор награды или None.
-    """
-    from src.bot.utils.growth_engine import check_referral_milestone
-
-    count = await count_referrals(referrer_id)
-    ms = check_referral_milestone(count)
-    return ms["reward"] if ms else None
+# ──────────────────────── Scheduled Tasks ─────────────────────────────
 
 
-# ──────────────────────── Feedback / NPS ─────────────────────────────────
+class ScheduledTaskDTO(BaseModel):
+    id: int
+    task_type: str
+    user_id: int
+    payload: Any = {}
+    status: str = "pending"
+    run_at: datetime
+    created_at: Optional[datetime] = None
+    executed_at: Optional[datetime] = None
+    error: Optional[str] = None
 
-async def save_feedback_score(user_id: int, score: int, context: str = "") -> FeedbackScore:
-    """Сохраняет NPS-оценку."""
+    model_config = {"from_attributes": True}
+
+
+def _to_task_dto(task: ScheduledTask) -> ScheduledTaskDTO:
+    raw = ScheduledTaskDTO.model_validate(task)
+    if isinstance(raw.payload, str):
+        try:
+            raw.payload = json.loads(raw.payload)
+        except (json.JSONDecodeError, TypeError):
+            raw.payload = {}
+    if not isinstance(raw.payload, dict):
+        raw.payload = {}
+    return raw
+
+
+async def create_scheduled_task(
+    task_type: str,
+    user_id: int,
+    run_at: datetime,
+    payload: dict[str, Any] | None = None,
+) -> ScheduledTaskDTO:
+    """Создаёт отложенную задачу в БД."""
     async with async_session() as session:
-        fb = FeedbackScore(user_id=user_id, score=score, context=context)
-        session.add(fb)
+        task = ScheduledTask(
+            task_type=task_type,
+            user_id=user_id,
+            payload=json.dumps(payload or {}, ensure_ascii=False),
+            status="pending",
+            run_at=run_at,
+        )
+        session.add(task)
         await session.commit()
-        await session.refresh(fb)
-        logger.info("Feedback saved: user_id=%s, score=%d", user_id, score)
-        return fb
+        await session.refresh(task)
+        logger.debug("Task created: id=%s type=%s user=%s run_at=%s", task.id, task_type, user_id, run_at)
+        return _to_task_dto(task)
 
 
-async def get_feedback_stats() -> dict:
-    """Средний NPS и статистика."""
+async def get_due_tasks(limit: int = 50) -> list[ScheduledTaskDTO]:
+    """Возвращает задачи со статусом 'pending' и run_at <= now."""
+    now = datetime.now(timezone.utc)
     async with async_session() as session:
-        result = await session.execute(
-            select(
-                sa_func.count(FeedbackScore.id),
-                sa_func.avg(FeedbackScore.score),
+        stmt = (
+            select(ScheduledTask)
+            .where(
+                ScheduledTask.status == "pending",
+                ScheduledTask.run_at <= now,
+            )
+            .order_by(ScheduledTask.run_at.asc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return [_to_task_dto(t) for t in result.scalars().all()]
+
+
+async def mark_task_done(task_id: int) -> None:
+    """Помечает задачу как выполненную."""
+    async with async_session() as session:
+        stmt = (
+            update(ScheduledTask)
+            .where(ScheduledTask.id == task_id)
+            .values(
+                status="done",
+                executed_at=datetime.now(timezone.utc),
             )
         )
-        row = result.one()
-        total = row[0] or 0
-        avg = float(row[1]) if row[1] else 0.0
-        return {"total": total, "avg": round(avg, 1)}
+        await session.execute(stmt)
+        await session.commit()
 
 
-# ──────────────────────── Waitlist ───────────────────────────────────────
+async def mark_task_failed(task_id: int, error: str = "") -> None:
+    """Помечает задачу как проваленную."""
+    async with async_session() as session:
+        stmt = (
+            update(ScheduledTask)
+            .where(ScheduledTask.id == task_id)
+            .values(
+                status="failed",
+                executed_at=datetime.now(timezone.utc),
+                error=error[:500] if error else None,
+            )
+        )
+        await session.execute(stmt)
+        await session.commit()
 
-async def add_waitlist_entry(user_id: int, service_id: str) -> bool:
-    """Записывает пользователя в waitlist.
 
-    Returns:
-        True если записан, False если уже есть.
-    """
+async def cancel_tasks_for_user(user_id: int) -> int:
+    """Отменяет все pending-задачи пользователя (для test_flow)."""
+    async with async_session() as session:
+        stmt = (
+            update(ScheduledTask)
+            .where(
+                ScheduledTask.user_id == user_id,
+                ScheduledTask.status == "pending",
+            )
+            .values(status="cancelled")
+        )
+        result = await session.execute(stmt)
+        await session.commit()
+        count = result.rowcount
+        if count:
+            logger.info("Cancelled %d tasks for user_id=%s", count, user_id)
+        return count
+
+
+async def count_pending_tasks() -> int:
+    """Количество pending-задач (для мониторинга)."""
+    async with async_session() as session:
+        stmt = select(sa_func.count()).select_from(ScheduledTask).where(
+            ScheduledTask.status == "pending",
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Topic Subscriptions
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def subscribe_to_topic(user_id: int, category: str) -> bool:
+    """Подписывает пользователя на тему. Возвращает True если создана новая подписка."""
     async with async_session() as session:
         existing = await session.execute(
-            select(WaitlistEntry).where(
-                WaitlistEntry.user_id == user_id,
-                WaitlistEntry.service_id == service_id,
+            select(TopicSubscription).where(
+                TopicSubscription.user_id == user_id,
+                TopicSubscription.category == category,
             )
         )
         if existing.scalar_one_or_none():
             return False
-
-        entry = WaitlistEntry(user_id=user_id, service_id=service_id)
-        session.add(entry)
+        session.add(TopicSubscription(user_id=user_id, category=category))
         await session.commit()
-        logger.info("Waitlist: user_id=%s -> service=%s", user_id, service_id)
+        logger.info("Topic subscription created: user=%s cat='%s'", user_id, category)
         return True
 
 
-async def get_waitlist_users(service_id: str) -> list[int]:
-    """Получает user_id всех подписавшихся на waitlist."""
+async def unsubscribe_from_topic(user_id: int, category: str) -> bool:
+    """Отписывает пользователя от темы. Возвращает True если подписка была удалена."""
+    from sqlalchemy import delete as sa_delete
     async with async_session() as session:
-        result = await session.execute(
-            select(WaitlistEntry.user_id).where(
-                WaitlistEntry.service_id == service_id,
-            )
+        stmt = sa_delete(TopicSubscription).where(
+            TopicSubscription.user_id == user_id,
+            TopicSubscription.category == category,
         )
+        result = await session.execute(stmt)
+        await session.commit()
+        removed = result.rowcount > 0
+        if removed:
+            logger.info("Topic unsubscribed: user=%s cat='%s'", user_id, category)
+        return removed
+
+
+async def get_user_topic_subscriptions(user_id: int) -> list[str]:
+    """Возвращает список категорий, на которые подписан пользователь."""
+    async with async_session() as session:
+        stmt = select(TopicSubscription.category).where(
+            TopicSubscription.user_id == user_id,
+        )
+        result = await session.execute(stmt)
         return [row[0] for row in result.all()]
 
 
-# ──────────────────────── User с partner ─────────────────────────────────
-
-async def get_users_by_partner(partner_id: str) -> list[User]:
-    """Пользователи, пришедшие от конкретного партнёра."""
+async def get_subscribers_for_category(category: str) -> list[int]:
+    """Возвращает user_id всех подписчиков категории."""
     async with async_session() as session:
-        result = await session.execute(
-            select(User).where(User.partner_id == partner_id)
+        stmt = select(TopicSubscription.user_id).where(
+            TopicSubscription.category == category,
         )
-        return list(result.scalars().all())
+        result = await session.execute(stmt)
+        return [row[0] for row in result.all()]
 
 
-async def get_partner_stats() -> list[dict]:
-    """Статистика по партнёрам."""
+# ══════════════════════ User Profile ══════════════════════════════════════
+
+
+async def update_user_profile(user_id: int, **fields: str | None) -> bool:
+    """Обновляет профильные поля User (business_sphere, company_size, company_stage).
+
+    Returns:
+        True если обновлено.
+    """
+    allowed = {"business_sphere", "company_size", "company_stage"}
+    to_set = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not to_set:
+        return False
+
     async with async_session() as session:
-        result = await session.execute(
-            select(
-                User.partner_id,
-                sa_func.count(User.id).label("count"),
+        stmt = select(User).where(User.user_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        if not user:
+            return False
+        for k, v in to_set.items():
+            setattr(user, k, v[:255] if v else None)
+        await session.commit()
+        logger.info("Profile updated: user=%s fields=%s", user_id, list(to_set.keys()))
+        return True
+
+
+async def get_user_profile(user_id: int) -> dict[str, str | None]:
+    """Возвращает профильные данные пользователя."""
+    async with async_session() as session:
+        stmt = select(User).where(User.user_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        if not user:
+            return {}
+        return {
+            "business_sphere": user.business_sphere,
+            "company_size": user.company_size,
+            "company_stage": user.company_stage,
+        }
+
+
+async def get_profile_stats() -> dict[str, Any]:
+    """Статистика заполненности профилей (для /profiles)."""
+    async with async_session() as session:
+        total = (await session.execute(
+            select(sa_func.count()).select_from(User)
+        )).scalar_one() or 0
+
+        with_sphere = (await session.execute(
+            select(sa_func.count()).select_from(User)
+            .where(User.business_sphere.isnot(None), User.business_sphere != "")
+        )).scalar_one() or 0
+
+        with_size = (await session.execute(
+            select(sa_func.count()).select_from(User)
+            .where(User.company_size.isnot(None), User.company_size != "")
+        )).scalar_one() or 0
+
+        with_stage = (await session.execute(
+            select(sa_func.count()).select_from(User)
+            .where(User.company_stage.isnot(None), User.company_stage != "")
+        )).scalar_one() or 0
+
+        full_profile = (await session.execute(
+            select(sa_func.count()).select_from(User).where(
+                User.business_sphere.isnot(None), User.business_sphere != "",
+                User.company_size.isnot(None), User.company_size != "",
+                User.company_stage.isnot(None), User.company_stage != "",
             )
-            .where(User.partner_id.isnot(None), User.partner_id != "")
-            .group_by(User.partner_id)
-            .order_by(sa_func.count(User.id).desc())
+        )).scalar_one() or 0
+
+    return {
+        "total": total,
+        "with_sphere": with_sphere,
+        "with_size": with_size,
+        "with_stage": with_stage,
+        "full_profile": full_profile,
+    }
+
+
+async def mark_user_blocked(user_id: int) -> None:
+    """Помечает пользователя как заблокировавшего бот."""
+    async with async_session() as session:
+        stmt = update(User).where(User.user_id == user_id).values(bot_blocked=True)
+        await session.execute(stmt)
+        await session.commit()
+
+
+# ══════════════════════ Questions (Ask Lawyer) ═══════════════════════════
+
+
+class QuestionDTO(BaseModel):
+    id: int
+    user_id: int
+    question_text: str
+    answer_text: Optional[str] = None
+    status: str = "new"
+    admin_message_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    answered_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+async def save_question(user_id: int, text: str) -> QuestionDTO:
+    """Сохраняет вопрос пользователя."""
+    async with async_session() as session:
+        q = Question(user_id=user_id, question_text=text[:2000], status="new")
+        session.add(q)
+        await session.commit()
+        await session.refresh(q)
+        logger.info("Question saved: id=%s user=%s", q.id, user_id)
+        return QuestionDTO.model_validate(q)
+
+
+async def answer_question(question_id: int, answer_text: str) -> QuestionDTO | None:
+    """Сохраняет ответ юриста."""
+    async with async_session() as session:
+        stmt = select(Question).where(Question.id == question_id)
+        result = await session.execute(stmt)
+        q = result.scalar_one_or_none()
+        if not q:
+            return None
+        q.answer_text = answer_text[:5000]
+        q.status = "answered"
+        q.answered_at = datetime.now(timezone.utc)
+        await session.commit()
+        await session.refresh(q)
+        return QuestionDTO.model_validate(q)
+
+
+async def get_question(question_id: int) -> QuestionDTO | None:
+    """Получает вопрос по ID."""
+    async with async_session() as session:
+        stmt = select(Question).where(Question.id == question_id)
+        result = await session.execute(stmt)
+        q = result.scalar_one_or_none()
+        return QuestionDTO.model_validate(q) if q else None
+
+
+async def get_unanswered_questions(limit: int = 20) -> list[QuestionDTO]:
+    """Список неотвеченных вопросов."""
+    async with async_session() as session:
+        stmt = (
+            select(Question)
+            .where(Question.status == "new")
+            .order_by(Question.created_at.asc())
+            .limit(limit)
         )
-        return [
-            {"partner_id": row[0], "leads": row[1]}
-            for row in result.all()
-        ]
+        result = await session.execute(stmt)
+        return [QuestionDTO.model_validate(q) for q in result.scalars().all()]
 
 
-async def get_sleeping_users(days: int = 14) -> list[User]:
-    """Пользователи, которые не были активны N дней."""
+async def get_questions_stats() -> dict[str, int]:
+    """Статистика вопросов для админки."""
+    async with async_session() as session:
+        total = (await session.execute(
+            select(sa_func.count()).select_from(Question)
+        )).scalar_one() or 0
+        unanswered = (await session.execute(
+            select(sa_func.count()).select_from(Question).where(Question.status == "new")
+        )).scalar_one() or 0
+        answered = (await session.execute(
+            select(sa_func.count()).select_from(Question).where(Question.status == "answered")
+        )).scalar_one() or 0
+    return {"total": total, "unanswered": unanswered, "answered": answered}
+
+
+# ══════════════════════ Funnel Analytics ═════════════════════════════════
+
+
+async def track(
+    user_id: int,
+    step: str,
+    *,
+    guide_id: str | None = None,
+    source: str | None = None,
+    meta: str | None = None,
+) -> None:
+    """Записывает событие воронки. Вызов fire-and-forget — не тормозит хендлер."""
+    try:
+        async with async_session() as session:
+            event = FunnelEvent(
+                user_id=user_id,
+                step=step,
+                guide_id=guide_id,
+                source=source,
+                meta=meta,
+            )
+            session.add(event)
+            await session.commit()
+    except Exception as e:
+        logger.warning("Funnel track error (%s/%s): %s", step, user_id, e)
+
+
+async def get_funnel_stats(
+    hours: int = 24,
+    source_filter: str | None = None,
+) -> list[tuple[str, int, int]]:
+    """Возвращает статистику по шагам воронки.
+
+    Args:
+        hours: Временное окно (последние N часов).
+        source_filter: Если указан, фильтрует по traffic source.
+
+    Returns:
+        Список (step, unique_users, total_events), отсортированный
+        по порядку воронки.
+    """
     from datetime import timedelta
 
-    threshold = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+
     async with async_session() as session:
-        result = await session.execute(
-            select(User).where(
-                User.last_activity < threshold,
-                User.last_activity.isnot(None),
+        stmt = (
+            select(
+                FunnelEvent.step,
+                sa_func.count(FunnelEvent.user_id.distinct()).label("users"),
+                sa_func.count().label("events"),
             )
+            .where(FunnelEvent.created_at >= since)
         )
-        return list(result.scalars().all())
+
+        if source_filter:
+            stmt = stmt.where(FunnelEvent.source.contains(source_filter))
+
+        stmt = stmt.group_by(FunnelEvent.step)
+        result = await session.execute(stmt)
+        rows = [(r[0], r[1], r[2]) for r in result.all()]
+
+    # Сортируем по порядку воронки
+    order = {
+        "bot_start": 0,
+        "view_categories": 1,
+        "view_category": 2,
+        "view_guide": 3,
+        "click_download": 4,
+        "sub_prompt": 5,
+        "sub_confirmed": 6,
+        "email_prompt": 7,
+        "email_submitted": 8,
+        "consent_given": 9,
+        "pdf_delivered": 10,
+        "consultation": 11,
+    }
+    rows.sort(key=lambda r: order.get(r[0], 99))
+    return rows
 
 
-# --- Import datetime for use in functions ---
-from datetime import datetime, timezone
+async def get_codownload_matrix(min_shared: int = 2) -> dict[str, list[tuple[str, int]]]:
+    """Коллаборативная фильтрация: «часто скачивают вместе».
+
+    Считает, сколько пользователей скачали пару гайдов (A, B), и
+    возвращает отсортированный маппинг.
+
+    Args:
+        min_shared: Минимум общих пользователей для включения пары.
+
+    Returns:
+        ``{guide_id: [(other_guide_id, shared_users), ...]}``
+        отсортированный по убыванию ``shared_users``.
+    """
+    async with async_session() as session:
+        # Self-join: для каждого пользователя находим все пары скачанных гайдов
+        a = Lead.__table__.alias("a")
+        b = Lead.__table__.alias("b")
+
+        from sqlalchemy import and_, literal_column
+
+        stmt = (
+            select(
+                a.c.selected_guide.label("guide_a"),
+                b.c.selected_guide.label("guide_b"),
+                sa_func.count(a.c.user_id.distinct()).label("shared"),
+            )
+            .select_from(
+                a.join(b, and_(
+                    a.c.user_id == b.c.user_id,
+                    a.c.selected_guide < b.c.selected_guide,
+                ))
+            )
+            .where(
+                a.c.selected_guide != "__consultation__",
+                b.c.selected_guide != "__consultation__",
+            )
+            .group_by(a.c.selected_guide, b.c.selected_guide)
+            .having(literal_column("shared") >= min_shared)
+            .order_by(literal_column("shared").desc())
+        )
+        result = await session.execute(stmt)
+        rows = result.all()
+
+    from collections import defaultdict
+    matrix: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for guide_a, guide_b, shared in rows:
+        matrix[guide_a].append((guide_b, shared))
+        matrix[guide_b].append((guide_a, shared))
+
+    # Сортируем каждый список по убыванию
+    for gid in matrix:
+        matrix[gid].sort(key=lambda x: -x[1])
+
+    return dict(matrix)
+
+
+async def get_new_users_count(hours: int = 24) -> int:
+    """Новые пользователи за последние N часов."""
+    from datetime import timedelta
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    async with async_session() as session:
+        stmt = select(sa_func.count()).select_from(User).where(User.created_at >= since)
+        return (await session.execute(stmt)).scalar_one() or 0
+
+
+async def get_active_users_count(hours: int = 24) -> int:
+    """Активные пользователи за последние N часов."""
+    from datetime import timedelta
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    async with async_session() as session:
+        stmt = select(sa_func.count()).select_from(User).where(User.last_activity >= since)
+        return (await session.execute(stmt)).scalar_one() or 0
+
+
+async def get_new_leads_count(hours: int = 24) -> int:
+    """Новые лиды за последние N часов (без __consultation__)."""
+    from datetime import timedelta
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    async with async_session() as session:
+        stmt = (
+            select(sa_func.count()).select_from(Lead)
+            .where(Lead.created_at >= since, Lead.selected_guide != "__consultation__")
+        )
+        return (await session.execute(stmt)).scalar_one() or 0
+
+
+async def get_top_guides_period(hours: int = 24, limit: int = 5) -> list[tuple[str, int]]:
+    """Топ гайдов по скачиваниям за период.
+
+    Returns:
+        [(guide_id, download_count), ...] — отсортировано по убыванию.
+    """
+    from datetime import timedelta
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    async with async_session() as session:
+        stmt = (
+            select(Lead.selected_guide, sa_func.count(Lead.user_id.distinct()))
+            .where(Lead.created_at >= since, Lead.selected_guide != "__consultation__")
+            .group_by(Lead.selected_guide)
+            .order_by(sa_func.count(Lead.user_id.distinct()).desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return [(r[0], r[1]) for r in result.all()]
+
+
+async def get_consultations_count(hours: int = 24) -> int:
+    """Количество записей на консультацию за период."""
+    from datetime import timedelta
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    async with async_session() as session:
+        stmt = (
+            select(sa_func.count()).select_from(Lead)
+            .where(Lead.created_at >= since, Lead.selected_guide == "__consultation__")
+        )
+        return (await session.execute(stmt)).scalar_one() or 0
+
+
+async def get_total_users_count() -> int:
+    """Общее количество пользователей в БД."""
+    async with async_session() as session:
+        stmt = select(sa_func.count()).select_from(User)
+        return (await session.execute(stmt)).scalar_one() or 0
+
+
+async def get_funnel_by_source(hours: int = 168) -> dict[str, dict[str, int]]:
+    """Статистика воронки в разрезе источников трафика.
+
+    Returns:
+        {source: {step: unique_users}}
+    """
+    from datetime import timedelta
+    from collections import defaultdict
+
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    async with async_session() as session:
+        stmt = (
+            select(
+                FunnelEvent.source,
+                FunnelEvent.step,
+                sa_func.count(FunnelEvent.user_id.distinct()),
+            )
+            .where(
+                FunnelEvent.created_at >= since,
+                FunnelEvent.source.isnot(None),
+                FunnelEvent.source != "",
+            )
+            .group_by(FunnelEvent.source, FunnelEvent.step)
+        )
+        result = await session.execute(stmt)
+
+    data: dict[str, dict[str, int]] = defaultdict(dict)
+    for source, step, users in result.all():
+        data[source][step] = users
+
+    return dict(data)

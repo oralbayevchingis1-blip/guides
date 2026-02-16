@@ -1,22 +1,111 @@
-"""Обработчик команды /start — точка входа в воронку."""
+"""Обработчик /start — точка входа в воронку.
+
+Value-first подход:
+    /start показывает ценность (категории гайдов) сразу.
+    Барьеры (подписка на канал + email) проверяются только
+    при нажатии Скачать в download-хендлере.
+
+UTM-трекинг через deep link:
+    /start guide_ID--src_EMAIL--med_NEWSLETTER--cmp_FEB2026
+    Разделитель ``--``, префиксы: src_ (source), med_ (medium), cmp_ (campaign).
+"""
 
 import asyncio
 import logging
+from typing import NamedTuple
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from src.bot.keyboards.inline import guides_menu_keyboard, subscription_keyboard
+from src.bot.keyboards.inline import categories_keyboard, guides_menu_keyboard, library_keyboard, main_menu_keyboard, subscription_keyboard
 from src.bot.utils.cache import TTLCache
 from src.bot.utils.google_sheets import GoogleSheetsClient
 from src.bot.utils.subscription_check import check_subscription
 from src.constants import get_text
-from src.database.crud import get_or_create_user, save_referral
+from src.database.crud import get_or_create_user, get_lead_by_user_id, get_user_downloaded_guides, track
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+
+# ── UTM parsing ────────────────────────────────────────────────────────
+
+
+class UTMData(NamedTuple):
+    """Структурированные UTM-параметры из deep link."""
+    source: str    # utm_source (email, facebook, linkedin, channel)
+    medium: str    # utm_medium (newsletter, cpc, organic, post)
+    campaign: str  # utm_campaign (feb2026, investment_webinar)
+    raw: str       # исходная строка целиком
+
+
+def parse_utm(raw_args: str) -> UTMData:
+    """Извлекает UTM-метки из deep-link параметра.
+
+    Поддерживает два формата:
+
+    Полный:
+        ``payload--src_SOURCE--med_MEDIUM--cmp_CAMPAIGN``
+
+    Короткий (только source):
+        ``payload--SOURCE``
+        Если сегмент после ``--`` не содержит префикса ``src_/med_/cmp_``,
+        он интерпретируется как source.
+
+    Любой сегмент может отсутствовать. Разделитель ``--``.
+
+    Examples:
+        >>> parse_utm("guide_TOO--src_email--med_newsletter--cmp_feb2026")
+        UTMData(source='email', medium='newsletter', campaign='feb2026', ...)
+        >>> parse_utm("guide_invest--linkedin")
+        UTMData(source='linkedin', medium='', campaign='', ...)
+        >>> parse_utm("guide_TOO")
+        UTMData(source='', medium='', campaign='', raw='guide_TOO')
+    """
+    source = medium = campaign = ""
+    segments = raw_args.split("--")
+    for seg_raw in segments[1:]:
+        seg = seg_raw.strip()
+        if seg.startswith("src_"):
+            source = seg[4:]
+        elif seg.startswith("med_"):
+            medium = seg[4:]
+        elif seg.startswith("cmp_"):
+            campaign = seg[4:]
+        elif not source and seg:
+            source = seg
+    return UTMData(source=source, medium=medium, campaign=campaign, raw=raw_args)
+
+
+def strip_utm(raw_args: str) -> str:
+    """Возвращает payload без UTM-сегментов.
+
+    >>> strip_utm("guide_TOO--src_email--med_newsletter")
+    'guide_TOO'
+    """
+    parts = [p.strip() for p in raw_args.split("--")
+             if not p.strip().startswith(("src_", "med_", "cmp_"))]
+    return parts[0] if parts else raw_args
+
+
+def format_utm_source(utm: UTMData) -> str:
+    """Форматирует UTM для хранения в поле traffic_source.
+
+    Результат: ``payload | src=X med=Y cmp=Z`` или просто payload.
+    """
+    parts = []
+    if utm.source:
+        parts.append(f"src={utm.source}")
+    if utm.medium:
+        parts.append(f"med={utm.medium}")
+    if utm.campaign:
+        parts.append(f"cmp={utm.campaign}")
+    if parts:
+        base = strip_utm(utm.raw)
+        return f"{base} | {' '.join(parts)}"
+    return utm.raw
 
 
 @router.message(CommandStart())
@@ -30,135 +119,391 @@ async def cmd_start(
 ) -> None:
     """Обработка команды /start.
 
-    1. Парсит deep-link параметр (источник трафика).
-    2. Сохраняет/обновляет пользователя в БД.
-    3. Загружает тексты и каталог из Google Sheets (через кеш).
-    4. Проверяет подписку на канал.
-    5. Если не подписан — показывает кнопку подписки.
-    6. Если подписан — показывает меню гайдов.
-
-    Deep-link примеры:
-        t.me/SOLIS_Partners_Legal_bot?start=instagram
-        t.me/SOLIS_Partners_Legal_bot?start=linkedin_post_feb
-        t.me/SOLIS_Partners_Legal_bot?start=channel_pin
+    Value-first: сначала ценность (категории / превью гайда),
+    барьеры (подписка + email) — только при скачивании.
     """
     user = message.from_user
     if user is None:
         return
 
-    # Парсим deep-link параметр (UTM / partner / referral)
-    from src.bot.utils.growth_engine import parse_utm_source
+    raw_args = command.args or ""
 
-    raw_source = command.args or ""
-    utm = parse_utm_source(raw_source)
-    source = utm.get("source", raw_source)
-    partner_id = utm.get("partner_id", "")
+    # ── UTM-трекинг ───────────────────────────────────────────────────
+    utm = parse_utm(raw_args)
+    clean_args = strip_utm(raw_args)
+    source_str = format_utm_source(utm)
 
-    if raw_source:
+    if utm.source:
         logger.info(
-            "Deep-link: '%s' → type=%s, source=%s, partner=%s (user_id=%s)",
-            raw_source, utm["type"], source, partner_id, user.id,
+            "UTM detected: user=%s src=%s med=%s cmp=%s",
+            user.id, utm.source, utm.medium, utm.campaign,
         )
 
-    # Сохраняем пользователя в БД (SQLite backup)
-    db_user = await get_or_create_user(
+    # ── Воронка: событие bot_start ────────────────────────────────────
+    asyncio.create_task(track(
+        user.id, "bot_start",
+        source=source_str or None,
+        meta=clean_args[:100] if clean_args else None,
+    ))
+
+    # ── Deep Link: гайд (guide_*) — показываем карточку сразу ────────
+    if clean_args.startswith("guide_"):
+        guide_slug = clean_args.removeprefix("guide_")
+        logger.info("Guide deep link: user=%s, guide=%s, utm_src=%s", user.id, guide_slug, utm.source)
+
+        await get_or_create_user(
+            user_id=user.id, username=user.username, full_name=user.full_name,
+            traffic_source=source_str if source_str else None,
+        )
+        await state.clear()
+        await state.update_data(traffic_source=source_str)
+
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        matched_guide = None
+        for guide in catalog:
+            if str(guide.get("id", "")) == guide_slug:
+                matched_guide = guide
+                break
+
+        if not matched_guide:
+            guide_name_lower = guide_slug.replace("-", " ").replace("_", " ").lower()
+            for guide in catalog:
+                if (
+                    guide_name_lower in guide.get("title", "").lower()
+                    or guide_name_lower in guide.get("category", "").lower()
+                    or guide.get("id", "").lower() == guide_name_lower
+                ):
+                    matched_guide = guide
+                    break
+
+        if matched_guide:
+            guide_id = matched_guide.get("id", "")
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"📥 Получить: {matched_guide['title']}",
+                    callback_data=f"download_{guide_id}",
+                )],
+                [InlineKeyboardButton(
+                    text="🔹 Все темы", callback_data="show_categories",
+                )],
+            ])
+            await message.answer(
+                f"📚 <b>{matched_guide['title']}</b>\n\n"
+                f"{matched_guide.get('description', '')}\n\n"
+                "Нажмите кнопку ниже, чтобы получить гайд:",
+                reply_markup=kb,
+            )
+        else:
+            await message.answer(
+                "Привет! Я помогу разобраться в юридических "
+                "вопросах бизнеса в Казахстане.\n\n"
+                "Выберите тему:",
+                reply_markup=categories_keyboard(catalog),
+            )
+        return
+
+    # ── Deep Link: статья (article_*) → Instant View ───────────────
+    if clean_args.startswith("article_"):
+        article_slug = clean_args.removeprefix("article_")
+        logger.info("Article deep link: user=%s, article=%s, utm_src=%s", user.id, article_slug, utm.source)
+
+        await get_or_create_user(
+            user_id=user.id, username=user.username, full_name=user.full_name,
+            traffic_source=source_str if source_str else None,
+        )
+
+        article = await google.get_article_by_id(article_slug)
+        if article:
+            title = article.get("title", article_slug)
+            desc = article.get("description", "")
+            telegraph_url = article.get("telegraph_url", "")
+            external_url = article.get("external_url", article.get("url", ""))
+
+            text_parts = [f"📰 <b>{title}</b>"]
+            if desc:
+                text_parts.append(f"\n{desc}")
+
+            buttons = []
+            if telegraph_url:
+                buttons.append([InlineKeyboardButton(
+                    text="📖 Читать статью",
+                    url=telegraph_url,
+                )])
+            elif external_url:
+                buttons.append([InlineKeyboardButton(
+                    text="📖 Читать статью",
+                    url=external_url,
+                )])
+            buttons.append([InlineKeyboardButton(
+                text="🔹 Скачать гайд по теме",
+                callback_data="show_categories",
+            )])
+
+            await message.answer(
+                "\n".join(text_parts),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            )
+        else:
+            catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+            await message.answer(
+                "📰 К сожалению, статья не найдена.\n\n"
+                "📚 Но у нас есть полезные гайды для вашего бизнеса:",
+                reply_markup=categories_keyboard(catalog),
+            )
+        return
+
+    # ── Deep Link: реферал (ref_{user_id}) ──────────────────────────
+    if clean_args.startswith("ref_"):
+        referrer_id = clean_args.removeprefix("ref_")
+        logger.info("Referral deep link: user=%s, referrer=%s", user.id, referrer_id)
+
+    # ── Стандартный /start flow ───────────────────────────────────────
+    # Value-first: сразу показываем категории гайдов.
+    # Барьеры (подписка + email) — только при нажатии «Скачать».
+
+    source = source_str
+    if raw_args:
+        logger.info("Deep-link: '%s' (user_id=%s, utm=%s)", raw_args, user.id, source_str)
+
+    await get_or_create_user(
         user_id=user.id,
         username=user.username,
         full_name=user.full_name,
+        traffic_source=source_str if source_str else None,
     )
 
-    # Сохраняем partner_id и source если пришёл от партнёра
-    if partner_id or utm["type"] != "direct":
-        try:
-            from src.database.models import async_session as _asession
-            async with _asession() as session:
-                from sqlalchemy import select
-                from src.database.models import User as UserModel
-                stmt = select(UserModel).where(UserModel.user_id == user.id)
-                result = await session.execute(stmt)
-                u = result.scalar_one_or_none()
-                if u:
-                    if partner_id and not u.partner_id:
-                        u.partner_id = partner_id
-                    if source and not u.traffic_source:
-                        u.traffic_source = source
-                    await session.commit()
-        except Exception:
-            pass
+    logger.info("Команда /start от user_id=%s, src=%s", user.id, source_str)
 
-    logger.info("Команда /start от user_id=%s", user.id)
-
-    # P5: Телеметрия
-    try:
-        from src.bot.utils.telemetry import track_event
-        asyncio.create_task(track_event(user.id, "bot_started", {
-            "source": source, "type": utm["type"],
-        }))
-    except Exception:
-        pass
-
-    # Обработка реферальной ссылки (ref_{user_id})
-    if utm["type"] == "referral":
-        try:
-            referrer_id = int(utm.get("referrer_id", "0"))
-            was_saved = await save_referral(
-                referrer_id=referrer_id,
-                referred_id=user.id,
-            )
-            if was_saved:
-                # Импортируем здесь чтобы избежать циклической зависимости
-                from src.bot.handlers.referral import notify_referrer
-
-                asyncio.create_task(
-                    notify_referrer(
-                        bot,
-                        referrer_id=referrer_id,
-                        new_user_name=user.full_name or user.username or "Новый пользователь",
-                    )
-                )
-                logger.info("Реферал: %s привёл %s", referrer_id, user.id)
-        except (ValueError, TypeError):
-            logger.warning("Невалидный реферальный ID: '%s'", source)
-
-    # Сброс состояния FSM (на случай повторного /start)
     await state.clear()
 
-    # Сохраняем source + partner в FSM state для записи лида
     if source:
-        await state.update_data(
-            traffic_source=source,
-            partner_id=partner_id,
-            utm_type=utm["type"],
-            utm_campaign=utm.get("campaign", ""),
-        )
+        await state.update_data(traffic_source=source)
 
-    # Автодетекция языка по Telegram language_code
-    from src.bot.utils.i18n import get_user_lang, set_user_lang
-    tg_lang = user.language_code or ""
-    user_lang = get_user_lang(user.id, tg_lang)
-    set_user_lang(user.id, user_lang)
-
-    # Загружаем тексты и каталог из Google Sheets (с кешем)
-    texts = await cache.get_or_fetch("texts", google.get_bot_texts)
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
 
-    # Проверка подписки
-    is_subscribed = await check_subscription(user.id, bot)
+    # Персонализация для возвращающегося пользователя
+    try:
+        existing_lead = await get_lead_by_user_id(user.id)
+    except Exception:
+        existing_lead = None
 
-    if not is_subscribed:
-        await message.answer(
-            get_text(texts, "welcome_not_subscribed"),
-            reply_markup=subscription_keyboard(),
-        )
-    else:
+    await message.answer("⚙️", reply_markup=main_menu_keyboard())
+
+    if existing_lead:
+        # ── Возвращающийся пользователь ───────────────────────────
+        try:
+            name = existing_lead.name
+            if utm.source == "email":
+                welcome_text = (
+                    f"👋 <b>{name}</b>, рады видеть вас из рассылки!\n\n"
+                    "Вот свежие гайды, которые могут быть полезны:"
+                )
+            elif utm.source in ("facebook", "instagram", "fb", "ig"):
+                welcome_text = (
+                    f"👋 <b>{name}</b>, добро пожаловать из соцсетей!\n\n"
+                    "Здесь — бесплатные PDF-гайды. Выберите тему:"
+                )
+            elif utm.source == "linkedin":
+                welcome_text = (
+                    f"👋 <b>{name}</b>, рады видеть вас из LinkedIn!\n\n"
+                    "Практические гайды для бизнеса в Казахстане:"
+                )
+            else:
+                welcome_text = (
+                    f"👋 С возвращением, <b>{name}</b>!\n\n"
+                    "Выберите тему — я пришлю PDF с пошаговыми "
+                    "инструкциями и чек-листами:"
+                )
+        except Exception:
+            welcome_text = "👋 С возвращением! Выберите тему:"
+
         try:
             await message.answer(
-                get_text(texts, "welcome_subscribed"),
-                reply_markup=guides_menu_keyboard(catalog),
+                welcome_text,
+                reply_markup=categories_keyboard(catalog),
             )
         except Exception as e:
             logger.error("Ошибка отображения каталога: %s", e)
             await message.answer(
-                get_text(texts, "welcome_subscribed")
-                + "\n\n⚠️ Ошибка загрузки каталога. Попробуйте /start снова.",
+                "Выберите тему — я пришлю PDF-гайд.\n\n"
+                "⚠️ Ошибка загрузки каталога. Попробуйте /start снова.",
             )
+    else:
+        # ── Новый пользователь — полноценное приветствие ──────────
+        intro_text = (
+            "Добрый день!\n\n"
+            "На связи бот юридической фирмы "
+            "<b>SOLIS Partners</b>.\n\n"
+            "🔹 <b>Кто мы</b>\n"
+            "Команда юристов, специализирующихся "
+            "на сопровождении бизнеса в Казахстане. "
+            "Работаем с IT-компаниями, стартапами "
+            "и международными проектами.\n\n"
+            "🔹 <b>Наша экспертиза</b>\n"
+            "— Налоговая оптимизация и IT-льготы\n"
+            "— Инвестиции, M&A и ESOP-программы\n"
+            "— Трудовое право и найм в МФЦА\n"
+            "— Интеллектуальная собственность в IT\n"
+            "— Корпоративная безопасность\n\n"
+            "🔹 <b>Нам доверяют</b>\n"
+            "Relog, Найми.Кз, Astana Hub, TrustMe, "
+            "TapHR и другие компании.\n\n"
+            "🔹 <b>Зачем этот бот</b>\n"
+            "Мы подготовили серию бесплатных PDF-гайдов "
+            "на основе реальных кейсов из нашей практики. "
+            "В каждом — пошаговые инструкции, чек-листы "
+            "и примеры документов, которые вы можете "
+            "использовать прямо сейчас.\n\n"
+            "Мы верим, что доступ к качественной юридической "
+            "информации помогает предпринимателям принимать "
+            "правильные решения ☺️"
+        )
+
+        await message.answer(intro_text)
+
+        # Второе сообщение — каталог с CTA
+        guide_count = len(catalog)
+        catalog_text = (
+            f"🔹 <b>У нас {guide_count} гайдов</b> по актуальным "
+            "юридическим темам.\n\n"
+            "Выберите интересующий — и я отправлю PDF "
+            "прямо сюда, в чат 👇"
+        )
+
+        try:
+            await message.answer(
+                catalog_text,
+                reply_markup=categories_keyboard(catalog),
+            )
+        except Exception as e:
+            logger.error("Ошибка отображения каталога: %s", e)
+            await message.answer(
+                "Выберите тему — я пришлю PDF-гайд.\n\n"
+                "⚠️ Ошибка загрузки каталога. Попробуйте /start снова.",
+            )
+
+
+@router.message(F.text == "📚 Гайды")
+async def reply_guides_button(
+    message: Message,
+    bot: Bot,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Обработка кнопки 'Гайды' из постоянного меню."""
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+
+    if not catalog:
+        await message.answer("Каталог пуст. Попробуйте позже.")
+        return
+
+    await message.answer(
+        "📚 <b>Выберите тему:</b>",
+        reply_markup=categories_keyboard(catalog),
+    )
+
+
+@router.message(F.text == "📂 Мои гайды")
+async def reply_library_button(
+    message: Message,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Обработка кнопки 'Мои гайды' — показывает скачанные гайды."""
+    user_id = message.from_user.id
+    downloaded_ids = await get_user_downloaded_guides(user_id)
+
+    if not downloaded_ids:
+        await message.answer(
+            "📂 <b>Ваша библиотека пуста</b>\n\n"
+            "Вы ещё не скачивали гайды. Нажмите «📚 Гайды» чтобы выбрать первый!",
+        )
+        return
+
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    downloaded_guides = [g for g in catalog if g.get("id") in downloaded_ids]
+
+    if not downloaded_guides:
+        await message.answer(
+            "📂 <b>Ваша библиотека пуста</b>\n\n"
+            "Не удалось найти гайды. Попробуйте «📚 Гайды».",
+        )
+        return
+
+    await message.answer(
+        f"📂 <b>Ваша библиотека</b> ({len(downloaded_guides)} шт.)\n\n"
+        "Нажмите на гайд, чтобы скачать повторно:",
+        reply_markup=library_keyboard(downloaded_guides),
+    )
+
+
+@router.message(F.text == "/library")
+async def cmd_library(
+    message: Message,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Команда /library — алиас для кнопки 'Мои гайды'."""
+    await reply_library_button(message, google, cache)
+
+
+@router.message(F.text == "📩 Подписки")
+async def reply_subscriptions_button(message: Message, cache: TTLCache, google: GoogleSheetsClient) -> None:
+    """Обработка кнопки 'Подписки' — показывает текущие подписки на темы."""
+    from src.database.crud import get_user_topic_subscriptions
+
+    user_id = message.from_user.id
+    subs = await get_user_topic_subscriptions(user_id)
+
+    if not subs:
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        seen: dict[str, str] = {}
+        for g in catalog:
+            cat = g.get("category", "").strip()
+            if cat and cat not in seen:
+                from src.bot.keyboards.inline import _slugify_cat
+                seen[cat] = _slugify_cat(cat)
+
+        buttons = []
+        for cat_name, slug in seen.items():
+            buttons.append([InlineKeyboardButton(
+                text=f"📩 {cat_name}",
+                callback_data=f"topic_sub_{slug}",
+            )])
+
+        await message.answer(
+            "📩 <b>Подписки на темы</b>\n\n"
+            "У вас пока нет подписок. Выберите темы, по которым "
+            "хотите получать уведомления о новых гайдах:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
+        )
+        return
+
+    buttons = []
+    for cat_slug in subs:
+        buttons.append([InlineKeyboardButton(
+            text=f"❌ Отписаться от «{cat_slug}»",
+            callback_data=f"topic_unsub_{cat_slug}",
+        )])
+
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    seen: dict[str, str] = {}
+    for g in catalog:
+        cat = g.get("category", "").strip()
+        if cat and cat not in seen:
+            from src.bot.keyboards.inline import _slugify_cat
+            seen[cat] = _slugify_cat(cat)
+
+    for cat_name, slug in seen.items():
+        if slug not in subs:
+            buttons.append([InlineKeyboardButton(
+                text=f"📩 Подписаться: {cat_name}",
+                callback_data=f"topic_sub_{slug}",
+            )])
+
+    await message.answer(
+        f"📩 <b>Ваши подписки</b> ({len(subs)} шт.)\n\n"
+        "Вы получаете уведомления о новых гайдах по этим темам.\n"
+        "Нажмите, чтобы отписаться. Ниже — доступные для подписки:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
