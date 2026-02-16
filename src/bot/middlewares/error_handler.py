@@ -15,22 +15,9 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware, Bot
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from src.config import settings
-
-# Ошибки Telegram, которые безопасно подавлять (не ломают бота, не требуют действий)
-_SUPPRESSED_TELEGRAM_ERRORS = (
-    "message is not modified",
-    "query is too old",
-    "message to edit not found",
-    "message can't be edited",
-    "message can't be deleted",
-    "bot was blocked by the user",
-    "user is deactivated",
-    "chat not found",
-)
 
 logger = logging.getLogger(__name__)
 
@@ -67,18 +54,6 @@ class ErrorHandlingMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except Exception as exc:
-            # Подавляем безобидные ошибки Telegram API (не ломают бота)
-            if isinstance(exc, TelegramBadRequest):
-                exc_lower = str(exc).lower()
-                if any(s in exc_lower for s in _SUPPRESSED_TELEGRAM_ERRORS):
-                    logger.debug("Suppressed TelegramBadRequest: %s", exc)
-                    if isinstance(event, CallbackQuery):
-                        try:
-                            await event.answer()
-                        except Exception:
-                            pass
-                    return
-
             exc_name = type(exc).__name__
             exc_msg = str(exc)[:300]
             tb = traceback.format_exc()
@@ -112,6 +87,8 @@ class ErrorHandlingMiddleware(BaseMiddleware):
                 pass
 
             # НЕ re-raise — пользователь уже получил ответ.
+            # SelfHealingMiddleware выше по стеку уже обработал бы,
+            # но мы здесь ловим всё как последний рубеж.
 
     async def _reply_user(self, event: Message | CallbackQuery) -> None:
         """Отправляет пользователю дружелюбное сообщение об ошибке."""

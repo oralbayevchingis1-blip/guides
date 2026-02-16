@@ -1,17 +1,13 @@
 """Конфигурация приложения — загрузка переменных окружения."""
 
-from pathlib import Path
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-_env_path = Path(".env")
 
 
 class Settings(BaseSettings):
-    """Настройки бота, загружаемые из .env файла или системных переменных."""
+    """Настройки бота, загружаемые из .env файла."""
 
     model_config = SettingsConfigDict(
-        env_file=str(_env_path) if _env_path.exists() else None,
+        env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -27,22 +23,12 @@ class Settings(BaseSettings):
     # Google Workspace
     GOOGLE_CREDENTIALS_PATH: str = "google_credentials.json"
     GOOGLE_CREDENTIALS_BASE64: str = ""  # base64-encoded JSON (for Railway/Docker)
-    GOOGLE_CREDENTIALS_JSON: str = ""   # raw JSON string (alternative to base64)
     GOOGLE_SPREADSHEET_ID: str = ""  # ID таблицы из URL
     CACHE_TTL_SECONDS: int = 300  # 5 минут
 
     # AI
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
-    AI_ENABLED: bool = True
-
-    # Telegraph (Instant View)
-    TELEGRAPH_ACCESS_TOKEN: str = ""
-
-    # Digest / Team
-    TEAM_CHAT_ID: int = 0
-    DIGEST_HOUR: int = 9
-    DIGEST_ENABLED: bool = True
 
     # Privacy
     PRIVACY_POLICY_URL: str = "https://www.solispartners.kz/privacy"

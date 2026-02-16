@@ -18,9 +18,6 @@ COPY . .
 # Create data directory (will be overridden by Railway volume mount)
 RUN mkdir -p /app/data
 
-# Make entrypoint executable
-RUN chmod +x /app/entrypoint.sh
-
 # Non-root user
 RUN useradd -r -s /bin/false botuser && chown -R botuser:botuser /app
 USER botuser
@@ -29,4 +26,4 @@ USER botuser
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('https://api.telegram.org', timeout=5)" || exit 1
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "-m", "src.bot.main"]
