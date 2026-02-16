@@ -1,13 +1,17 @@
 """Конфигурация приложения — загрузка переменных окружения."""
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_env_path = Path(".env")
 
 
 class Settings(BaseSettings):
-    """Настройки бота, загружаемые из .env файла."""
+    """Настройки бота, загружаемые из .env файла или системных переменных."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_env_path) if _env_path.exists() else None,
         env_file_encoding="utf-8",
         extra="ignore",
     )
