@@ -15,15 +15,15 @@ COPY --from=deps /usr/local/bin /usr/local/bin
 # Copy application code
 COPY . .
 
-# Create data directory
+# Create data directory (will be overridden by Railway volume mount)
 RUN mkdir -p /app/data
 
 # Non-root user
 RUN useradd -r -s /bin/false botuser && chown -R botuser:botuser /app
 USER botuser
 
-# Health check: verify Telegram API is reachable and DB file exists
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+# Health check: verify Telegram API is reachable
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('https://api.telegram.org', timeout=5)" || exit 1
 
 CMD ["python", "-m", "src.bot.main"]

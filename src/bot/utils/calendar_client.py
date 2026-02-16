@@ -98,16 +98,22 @@ async def _get_gcal_slots(days_ahead: int) -> list[dict]:
     import json
 
     creds_path = settings.GOOGLE_CREDENTIALS_PATH
-    if not creds_path:
+    creds_b64 = getattr(settings, "GOOGLE_CREDENTIALS_BASE64", "")
+    if not creds_path and not creds_b64:
         raise RuntimeError("No Google credentials")
 
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
+    import base64
 
     SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
     def _fetch():
-        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+        if creds_b64:
+            info = json.loads(base64.b64decode(creds_b64))
+            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        else:
+            creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
         service = build("calendar", "v3", credentials=creds)
 
         now = datetime.now(timezone.utc)
@@ -216,13 +222,20 @@ async def _create_gcal_event(event_data: dict) -> str:
     from src.config import settings
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
+    import base64
+    import json as _json
 
     SCOPES = ["https://www.googleapis.com/auth/calendar"]
+    creds_b64 = getattr(settings, "GOOGLE_CREDENTIALS_BASE64", "")
 
     def _create():
-        creds = Credentials.from_service_account_file(
-            settings.GOOGLE_CREDENTIALS_PATH, scopes=SCOPES,
-        )
+        if creds_b64:
+            info = _json.loads(base64.b64decode(creds_b64))
+            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        else:
+            creds = Credentials.from_service_account_file(
+                settings.GOOGLE_CREDENTIALS_PATH, scopes=SCOPES,
+            )
         service = build("calendar", "v3", credentials=creds)
         event = service.events().insert(calendarId="primary", body=event_data).execute()
         return event.get("id", "")

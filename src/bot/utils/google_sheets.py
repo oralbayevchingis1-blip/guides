@@ -2,10 +2,12 @@
 управление статьями, дата-рум, новости, AI-диалоги, контент-календарь."""
 
 import asyncio
+import base64
 import functools
 import json as _json
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -131,14 +133,27 @@ class GoogleSheetsClient:
     Args:
         credentials_path: Путь к JSON-файлу сервисного аккаунта.
         spreadsheet_id: ID Google-таблицы из URL.
+        credentials_base64: base64-encoded JSON credentials (альтернатива файлу).
     """
 
-    def __init__(self, credentials_path: str, spreadsheet_id: str) -> None:
-        creds = Credentials.from_service_account_file(
-            credentials_path,
-            scopes=SCOPES,
-        )
-        self._creds = creds  # Сохраняем для Drive API
+    def __init__(
+        self,
+        credentials_path: str,
+        spreadsheet_id: str,
+        *,
+        credentials_base64: Optional[str] = None,
+    ) -> None:
+        if credentials_base64:
+            info = _json.loads(base64.b64decode(credentials_base64))
+            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+            logger.info("Google credentials loaded from base64 env variable")
+        else:
+            creds = Credentials.from_service_account_file(
+                credentials_path,
+                scopes=SCOPES,
+            )
+            logger.info("Google credentials loaded from file: %s", credentials_path)
+        self._creds = creds
         self.gc = gspread.authorize(creds)
         self.spreadsheet_id = spreadsheet_id
         self._spreadsheet: gspread.Spreadsheet | None = None

@@ -1,16 +1,46 @@
-.git
-__pycache__
-*.pyc
+# Secrets
 .env
-venv
-.venv
-tests
-*.md
-legal-partner-pro-review
-.cursor
-data
-*.db
-telegraph_token.txt
+.env.*
+google_credentials.json
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests
+tests/
 test_*.py
-.mypy_cache
-.pytest_cache
+pytest.ini
+
+# Docker (no inception)
+Dockerfile
+docker-compose*.yml
+
+# Docs / plans
+*.md
+*.plan.md
+LICENSE
+
+# Data (mounted as volume on Railway)
+data/

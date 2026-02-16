@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     # Google Workspace
     GOOGLE_CREDENTIALS_PATH: str = "google_credentials.json"
+    GOOGLE_CREDENTIALS_BASE64: str = ""  # base64-encoded JSON (for Railway/Docker)
     GOOGLE_SPREADSHEET_ID: str = ""  # ID таблицы из URL
     CACHE_TTL_SECONDS: int = 300  # 5 минут
 
