@@ -17,9 +17,11 @@ from src.bot.handlers import (
     broadcast,
     cabinet,
     consult,
+    consultation,
     content_manager,
     corporate,
     documents,
+    email_campaigns,
     feedback,
     group_mode,
     language,
@@ -27,6 +29,7 @@ from src.bot.handlers import (
     legal_tools,
     live_support,
     payments,
+    questions,
     referral,
     start,
     subscription,
@@ -45,6 +48,46 @@ from src.config import settings
 from src.database.models import init_db
 
 logger = logging.getLogger(__name__)
+
+# ── Module-level refs for scheduled jobs (set during main()) ────────────
+_bot: Bot | None = None
+_google: GoogleSheetsClient | None = None
+_cache: TTLCache | None = None
+
+
+async def _job_retention_check() -> None:
+    from src.bot.utils.retention import check_sleeping_users
+    await check_sleeping_users(bot=_bot, google=_google, cache=_cache)
+
+
+async def _job_growth_report() -> None:
+    from src.bot.utils.growth_report import send_growth_report
+    await send_growth_report(bot=_bot, google=_google, cache=_cache)
+
+
+async def _job_auto_stories() -> None:
+    from src.bot.utils.stories_publisher import auto_stories_check
+    await auto_stories_check(bot=_bot, google=_google, cache=_cache)
+
+
+async def _job_telemetry_flush() -> None:
+    from src.bot.utils.telemetry import scheduled_telemetry_flush
+    await scheduled_telemetry_flush(google=_google, cache=_cache)
+
+
+async def _job_funnel_analysis() -> None:
+    from src.bot.utils.telemetry import weekly_funnel_analysis
+    await weekly_funnel_analysis(bot=_bot, google=_google, cache=_cache)
+
+
+async def _job_daily_backup() -> None:
+    from src.backup import daily_backup
+    await daily_backup(bot=_bot)
+
+
+async def _job_qa_audit() -> None:
+    from src.bot.utils.vector_search import scheduled_qa_audit
+    await scheduled_qa_audit(bot=_bot, google=_google, cache=_cache)
 
 
 # ── Команды бота ────────────────────────────────────────────────────────
@@ -138,6 +181,7 @@ async def main() -> None:
     google = GoogleSheetsClient(
         credentials_path=settings.GOOGLE_CREDENTIALS_PATH,
         spreadsheet_id=settings.GOOGLE_SPREADSHEET_ID,
+        credentials_json=settings.GOOGLE_CREDENTIALS_JSON,
         credentials_base64=settings.GOOGLE_CREDENTIALS_BASE64,
     )
     cache = TTLCache(ttl_seconds=settings.CACHE_TTL_SECONDS)
@@ -193,14 +237,15 @@ async def main() -> None:
         misfire_grace_time=3600,
     )
 
+    # Set module-level refs for scheduled jobs
+    global _bot, _google, _cache
+    _bot = bot
+    _google = google
+    _cache = cache
+
     # Retention Loop — ежедневная проверка спящих пользователей (08:00 UTC)
-    from src.bot.utils.retention import check_sleeping_users
-
-    async def _retention_check():
-        await check_sleeping_users(bot=bot, google=google, cache=cache)
-
     scheduler.add_job(
-        _retention_check,
+        _job_retention_check,
         trigger="cron",
         hour=8, minute=0,
         id="daily_retention_check",
@@ -209,13 +254,8 @@ async def main() -> None:
     )
 
     # Weekly Growth Hacker Report (понедельник 09:00 UTC)
-    from src.bot.utils.growth_report import send_growth_report
-
-    async def _growth_report():
-        await send_growth_report(bot=bot, google=google, cache=cache)
-
     scheduler.add_job(
-        _growth_report,
+        _job_growth_report,
         trigger="cron",
         day_of_week="mon",
         hour=9, minute=0,
@@ -225,13 +265,8 @@ async def main() -> None:
     )
 
     # Auto-Stories: проверка новых статей каждые 4 часа
-    from src.bot.utils.stories_publisher import auto_stories_check
-
-    async def _auto_stories():
-        await auto_stories_check(bot=bot, google=google, cache=cache)
-
     scheduler.add_job(
-        _auto_stories,
+        _job_auto_stories,
         trigger="interval",
         hours=4,
         id="auto_stories_check",
@@ -240,13 +275,8 @@ async def main() -> None:
     )
 
     # P5: Телеметрия — сброс событий в Google Sheets каждые 6 часов
-    from src.bot.utils.telemetry import scheduled_telemetry_flush, weekly_funnel_analysis
-
-    async def _telemetry_flush():
-        await scheduled_telemetry_flush(google=google, cache=cache)
-
     scheduler.add_job(
-        _telemetry_flush,
+        _job_telemetry_flush,
         trigger="interval",
         hours=6,
         id="telemetry_flush",
@@ -255,11 +285,8 @@ async def main() -> None:
     )
 
     # P5: Еженедельный AI-анализ воронки (среда 10:00 UTC)
-    async def _funnel_analysis():
-        await weekly_funnel_analysis(bot=bot, google=google, cache=cache)
-
     scheduler.add_job(
-        _funnel_analysis,
+        _job_funnel_analysis,
         trigger="cron",
         day_of_week="wed",
         hour=10, minute=0,
@@ -269,13 +296,8 @@ async def main() -> None:
     )
 
     # P6: Ежедневный бэкап БД → отправка админу (04:00 UTC)
-    from src.backup import daily_backup
-
-    async def _daily_backup():
-        await daily_backup(bot=bot)
-
     scheduler.add_job(
-        _daily_backup,
+        _job_daily_backup,
         trigger="cron",
         hour=4, minute=0,
         id="daily_db_backup",
@@ -284,13 +306,8 @@ async def main() -> None:
     )
 
     # C10: Еженедельный QA аудит качества (пятница 16:00 UTC = 21:00 Алматы)
-    from src.bot.utils.vector_search import scheduled_qa_audit
-
-    async def _qa_audit():
-        await scheduled_qa_audit(bot=bot, google=google, cache=cache)
-
     scheduler.add_job(
-        _qa_audit,
+        _job_qa_audit,
         trigger="cron",
         day_of_week="fri",
         hour=16, minute=0,
@@ -364,6 +381,9 @@ async def main() -> None:
     dp.include_router(language.router)         # /lang выбор языка
     dp.include_router(timezone_handler.router) # /timezone + геолокация
     dp.include_router(waitlist_handler.router) # waitlist Coming Soon
+    dp.include_router(consultation.router)     # запись на консультацию
+    dp.include_router(questions.router)        # вопросы юристу
+    dp.include_router(email_campaigns.router)  # email-ретаргетинг
     dp.include_router(subscription.router)     # подписка колбеки
     dp.include_router(feedback.router)         # NPS/feedback колбеки
     dp.include_router(group_mode.router)       # мониторинг групп

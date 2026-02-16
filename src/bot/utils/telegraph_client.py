@@ -1,192 +1,150 @@
-"""Клиент Telegraph API — публикация статей для Instant View в Telegram.
+"""Простой клиент Telegraph API — публикация статей для Instant View."""
 
-Используется telegra.ph — встроенный в Telegram инструмент для чтения
-статей прямо внутри мессенджера (без перехода на внешний сайт).
-
-Использование:
-    from src.bot.utils.telegraph_client import publish_to_telegraph
-    url = await publish_to_telegraph("Заголовок", "<p>HTML-контент</p>")
-"""
-
-import json
 import logging
-import os
+from typing import Optional
+
+import aiohttp
+
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
 TELEGRAPH_API = "https://api.telegra.ph"
-TOKEN_FILE = os.path.join("data", "telegraph_token.txt")
-
-# Теги, поддерживаемые Telegraph
-ALLOWED_TAGS = frozenset({
-    "a", "aside", "b", "blockquote", "br", "code", "em",
-    "figcaption", "figure", "h3", "h4", "hr", "i", "img",
-    "li", "ol", "p", "pre", "s", "strong", "u", "ul",
-})
-
-# Маппинг HTML-тегов → теги Telegraph
-TAG_REMAP = {
-    "h1": "h3",
-    "h2": "h3",
-    "h5": "h4",
-    "h6": "h4",
-    "div": None,     # unwrap
-    "span": None,    # unwrap
-    "section": None, # unwrap
-    "article": None, # unwrap
-    "header": None,
-    "footer": None,
-    "main": None,
-    "nav": None,
-}
 
 
-def _html_to_nodes(html: str) -> list:
-    """Конвертирует HTML-строку в формат Telegraph Node."""
-    from bs4 import BeautifulSoup, NavigableString, Tag as BSTag
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    def _convert(element) -> list:
-        nodes = []
-        for child in element.children:
-            if isinstance(child, NavigableString):
-                text = str(child)
-                if text:
-                    nodes.append(text)
-            elif isinstance(child, BSTag):
-                tag = child.name.lower()
-                children = _convert(child)
-
-                # Remap to Telegraph-compatible tag
-                if tag in TAG_REMAP:
-                    mapped = TAG_REMAP[tag]
-                    if mapped is None:
-                        # Unwrap — keep children, discard tag
-                        nodes.extend(children)
-                        continue
-                    tag = mapped
-
-                if tag not in ALLOWED_TAGS:
-                    # Unsupported — unwrap
-                    nodes.extend(children)
-                    continue
-
-                node: dict = {"tag": tag}
-
-                # Preserve only relevant attributes
-                if tag == "a" and child.get("href"):
-                    node["attrs"] = {"href": child["href"]}
-                elif tag == "img" and child.get("src"):
-                    node["attrs"] = {"src": child["src"]}
-
-                if children:
-                    node["children"] = children
-
-                nodes.append(node)
-        return nodes
-
-    result = _convert(soup)
-
-    if not result:
-        result = [{"tag": "p", "children": ["(пустая статья)"]}]
-
-    return result
-
-
-async def _api_call(method: str, **params) -> dict:
-    """Вызов Telegraph API."""
-    import aiohttp
-
+async def create_account(short_name: str = "SOLIS Partners") -> str | None:
+    """Создаёт аккаунт Telegraph и возвращает access_token."""
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{TELEGRAPH_API}/{method}",
-            data=params,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            data = await resp.json()
-            if data.get("ok"):
-                return data["result"]
-            raise RuntimeError(f"Telegraph API: {data.get('error', 'unknown error')}")
-
-
-async def _get_or_create_token() -> str:
-    """Получает или создаёт аккаунт Telegraph."""
-    os.makedirs(os.path.dirname(TOKEN_FILE) or ".", exist_ok=True)
-
-    if os.path.isfile(TOKEN_FILE):
-        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-            token = f.read().strip()
-        if token:
+        resp = await session.post(
+            f"{TELEGRAPH_API}/createAccount",
+            json={"short_name": short_name, "author_name": short_name},
+        )
+        data = await resp.json()
+        if data.get("ok"):
+            token = data["result"]["access_token"]
+            logger.info("Telegraph account created, token=%s...", token[:10])
             return token
-
-    result = await _api_call(
-        "createAccount",
-        short_name="SOLIS Partners",
-        author_name="SOLIS Partners",
-        author_url="https://solispartners.kz",
-    )
-    token = result["access_token"]
-
-    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-        f.write(token)
-
-    logger.info("Telegraph аккаунт создан, токен сохранён")
-    return token
+        logger.error("Telegraph createAccount failed: %s", data)
+        return None
 
 
-async def publish_to_telegraph(
+async def publish_article(
     title: str,
     html_content: str,
     author_name: str = "SOLIS Partners",
+    author_url: str = "https://www.solispartners.kz",
     *,
-    cover_image_url: str = "",
-) -> str:
-    """Публикует статью в Telegraph. Возвращает URL.
+    guide_cta: Optional[dict] = None,
+) -> Optional[str]:
+    """Публикует статью в Telegraph. Возвращает URL или None.
 
     Args:
-        title: Заголовок статьи (1-256 символов).
-        html_content: Содержание в HTML.
-        author_name: Имя автора.
-        cover_image_url: URL обложки (DALL-E или другой). Вставляется первым блоком.
-
-    Returns:
-        URL опубликованной страницы (telegra.ph/...).
+        guide_cta: Если передан, в конец статьи добавляется CTA-блок
+            для скачивания гайда. Ожидаемые ключи:
+            ``title``, ``highlights`` (list[str]), ``preview`` (str),
+            ``pages`` (str), ``deep_link`` (str).
     """
-    token = await _get_or_create_token()
+    token = settings.TELEGRAPH_ACCESS_TOKEN
+    if not token:
+        logger.warning("TELEGRAPH_ACCESS_TOKEN не задан — публикация невозможна")
+        return None
 
-    # Вставляем обложку как первый блок статьи
-    cover_nodes: list = []
-    if cover_image_url:
-        cover_nodes = [
-            {
-                "tag": "figure",
-                "children": [
-                    {
-                        "tag": "img",
-                        "attrs": {"src": cover_image_url},
-                    },
-                    {
-                        "tag": "figcaption",
-                        "children": [f"© SOLIS Partners — {title[:100]}"],
-                    },
-                ],
+    content = _html_to_telegraph_nodes(html_content)
+
+    if guide_cta:
+        content.extend(_build_guide_cta_nodes(guide_cta))
+
+    async with aiohttp.ClientSession() as session:
+        resp = await session.post(
+            f"{TELEGRAPH_API}/createPage",
+            json={
+                "access_token": token,
+                "title": title,
+                "author_name": author_name,
+                "author_url": author_url,
+                "content": content,
+                "return_content": False,
             },
-        ]
+        )
+        data = await resp.json()
 
-    content_nodes = _html_to_nodes(html_content)
-    all_nodes = cover_nodes + content_nodes
+        if data.get("ok"):
+            url = data["result"]["url"]
+            logger.info("Статья опубликована: %s", url)
+            return url
 
-    result = await _api_call(
-        "createPage",
-        access_token=token,
-        title=title[:256],
-        content=json.dumps(all_nodes, ensure_ascii=False),
-        author_name=author_name[:128],
-        author_url="https://solispartners.kz",
-        return_content="false",
-    )
+        logger.error("Telegraph createPage failed: %s", data)
+        return None
 
-    url = result.get("url", "")
-    logger.info("Статья опубликована в Telegraph: %s", url)
-    return url
+
+def _html_to_telegraph_nodes(html: str) -> list:
+    """Конвертирует простой HTML-текст в Telegraph Node-формат.
+
+    Telegraph принимает массив Node-объектов. Для простоты разбиваем текст
+    по абзацам и оборачиваем в <p> теги.
+    """
+    paragraphs = [p.strip() for p in html.split("\n") if p.strip()]
+    nodes = []
+    for p in paragraphs:
+        if p.startswith("<"):
+            nodes.append({"tag": "p", "children": [p]})
+        else:
+            nodes.append({"tag": "p", "children": [p]})
+    return nodes if nodes else [{"tag": "p", "children": ["(пустая статья)"]}]
+
+
+def _build_guide_cta_nodes(cta: dict) -> list:
+    """Создаёт Telegraph-ноды для CTA-блока гайда в конце статьи.
+
+    Блок включает: разделитель, заголовок, выдержки, мета, кнопку-ссылку.
+    """
+    nodes: list = []
+
+    # Разделитель
+    nodes.append({"tag": "hr"})
+
+    # Заголовок
+    guide_title = cta.get("title", "")
+    nodes.append({
+        "tag": "h4",
+        "children": [f"📚 Скачайте полный гайд: «{guide_title}»"],
+    })
+
+    # Выдержки / что внутри
+    highlights = cta.get("highlights", [])
+    preview = cta.get("preview", "")
+
+    if highlights:
+        nodes.append({"tag": "p", "children": [
+            {"tag": "strong", "children": ["Внутри вы найдёте:"]},
+        ]})
+        items = []
+        for item in highlights[:5]:
+            items.append({"tag": "li", "children": [item]})
+        nodes.append({"tag": "ul", "children": items})
+    elif preview:
+        nodes.append({"tag": "p", "children": [
+            {"tag": "strong", "children": ["Что внутри: "]},
+            preview,
+        ]})
+
+    # Метаданные
+    meta_parts = []
+    pages = cta.get("pages", "")
+    if pages:
+        meta_parts.append(f"{pages} страниц")
+    meta_parts.extend(["шаблоны документов", "чек-листы", "бесплатно"])
+    nodes.append({"tag": "p", "children": [
+        {"tag": "em", "children": ["📎 " + " · ".join(meta_parts)]},
+    ]})
+
+    # Кнопка-ссылка
+    deep_link = cta.get("deep_link", "")
+    if deep_link:
+        nodes.append({"tag": "p", "children": [{
+            "tag": "a",
+            "attrs": {"href": deep_link},
+            "children": ["👉 Скачать бесплатно в Telegram-боте"],
+        }]})
+
+    return nodes

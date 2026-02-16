@@ -17,9 +17,22 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware, Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 
 from src.config import settings
+
+# Ошибки Telegram, которые безопасно подавлять
+_SUPPRESSED_TELEGRAM_ERRORS = (
+    "message is not modified",
+    "query is too old",
+    "message to edit not found",
+    "message can't be edited",
+    "message can't be deleted",
+    "bot was blocked by the user",
+    "user is deactivated",
+    "chat not found",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +103,12 @@ class SelfHealingMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except Exception as exc:
+            # Подавляем безобидные ошибки Telegram API — не тратим AI-токены
+            if isinstance(exc, TelegramBadRequest):
+                exc_lower = str(exc).lower()
+                if any(s in exc_lower for s in _SUPPRESSED_TELEGRAM_ERRORS):
+                    raise  # пусть ErrorHandlingMiddleware подавит тихо
+
             # Формируем traceback
             tb = traceback.format_exc()
             exc_name = type(exc).__name__

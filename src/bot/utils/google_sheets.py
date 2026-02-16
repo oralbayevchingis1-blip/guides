@@ -2,7 +2,6 @@
 управление статьями, дата-рум, новости, AI-диалоги, контент-календарь."""
 
 import asyncio
-import base64
 import functools
 import json as _json
 import logging
@@ -22,7 +21,10 @@ _CIRCUIT_OPEN_THRESHOLD = 5
 
 
 def retry_sheets(max_retries: int = 3, initial_delay: float = 1.0):
-    """Декоратор: retry с экспоненциальным backoff для Google Sheets API."""
+    """Декоратор: retry с экспоненциальным backoff для Google Sheets API.
+
+    Автоматически трекает success/failure в мониторинг.
+    """
 
     def decorator(func):
         @functools.wraps(func)
@@ -30,10 +32,12 @@ def retry_sheets(max_retries: int = 3, initial_delay: float = 1.0):
             global _consecutive_failures
             delay = initial_delay
             last_exc = None
+            method_name = func.__name__
             for attempt in range(max_retries):
                 try:
                     result = func(*args, **kwargs)
-                    _consecutive_failures = 0  # reset on success
+                    _consecutive_failures = 0
+                    _track_sheets("success", method_name)
                     return result
                 except gspread.exceptions.APIError as e:
                     last_exc = e
@@ -48,11 +52,13 @@ def retry_sheets(max_retries: int = 3, initial_delay: float = 1.0):
                         delay *= 2
                     else:
                         _consecutive_failures += 1
+                        _track_sheets("error", method_name)
                         raise
                 except Exception as e:
                     last_exc = e
                     _consecutive_failures += 1
                     if attempt == max_retries - 1:
+                        _track_sheets("error", method_name)
                         raise
                     logger.warning(
                         "Sheets attempt %d/%d failed: %s", attempt + 1, max_retries, e,
@@ -60,11 +66,30 @@ def retry_sheets(max_retries: int = 3, initial_delay: float = 1.0):
                     import time
                     time.sleep(delay)
                     delay *= 2
+            _track_sheets("error", method_name)
             raise last_exc  # type: ignore[misc]
 
         return wrapper
 
     return decorator
+
+
+def _track_sheets(result: str, method: str) -> None:
+    """Трекает Sheets API вызов в мониторинг (best-effort)."""
+    try:
+        from src.bot.utils.monitoring import alerts, metrics
+        if result == "success":
+            metrics.inc("sheets.success")
+        else:
+            metrics.inc_error("sheets_api")
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(alerts.check_sheets_health(False, method))
+            except RuntimeError:
+                pass
+    except Exception:
+        pass
 
 
 async def save_pending_write(method_name: str, payload: dict) -> None:
@@ -99,6 +124,45 @@ SHEET_NEWS = "News Feed"
 SHEET_CONTENT_CAL = "Content Calendar"
 SHEET_AI_CONV = "AI Conversations"
 SHEET_CONSULT_LOG = "Consult Log"
+SHEET_CONSULTATIONS = "Консультации"
+SHEET_RECOMMENDATIONS = "Рекомендации"
+SHEET_QUESTIONS = "Вопросы"
+
+
+# ── Ожидаемые схемы критических листов ──────────────────────────────────
+# Формат: sheet_name → {required: обязательные колонки, optional: желательные}
+# Имена колонок сравниваются case-insensitive.
+
+SHEET_SCHEMAS: dict[str, dict[str, list[str]]] = {
+    SHEET_CATALOG: {
+        "required": ["id", "title", "description", "drive_file_id", "active"],
+        "optional": ["category", "preview_text", "social_proof", "pages", "highlights"],
+    },
+    SHEET_TEXTS: {
+        "required": ["key", "text"],
+        "optional": [],
+    },
+    SHEET_LEADS: {
+        # Бот пишет позиционно (append_row), но читает по имени в
+        # _sync_update_lead_interests — если колонки переименованы,
+        # interests/warmth не обновятся, но запись лида не сломается.
+        "required": [],
+        "optional": ["user_id", "email", "guide", "timestamp", "username",
+                      "name", "consent", "source", "interests", "warmth"],
+    },
+    SHEET_FOLLOWUP: {
+        "required": ["key", "text"],
+        "optional": ["content_url", "content_type", "button_text", "delay_hours"],
+    },
+    SHEET_RECOMMENDATIONS: {
+        "required": ["guide_id", "next_guide_id"],
+        "optional": ["next_article_link", "message"],
+    },
+    SHEET_CONSULTATIONS: {
+        "required": ["User ID", "Телефон"],
+        "optional": ["Дата", "Username", "Имя", "Email", "Удобное время", "Статус"],
+    },
+}
 
 
 def _safe_get_all_records(ws) -> list[dict]:
@@ -133,7 +197,6 @@ class GoogleSheetsClient:
     Args:
         credentials_path: Путь к JSON-файлу сервисного аккаунта.
         spreadsheet_id: ID Google-таблицы из URL.
-        credentials_base64: base64-encoded JSON credentials (альтернатива файлу).
     """
 
     def __init__(
@@ -141,22 +204,47 @@ class GoogleSheetsClient:
         credentials_path: str,
         spreadsheet_id: str,
         *,
+        credentials_json: Optional[str] = None,
         credentials_base64: Optional[str] = None,
     ) -> None:
-        if credentials_base64:
-            info = _json.loads(base64.b64decode(credentials_base64))
-            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-            logger.info("Google credentials loaded from base64 env variable")
-        else:
-            creds = Credentials.from_service_account_file(
-                credentials_path,
-                scopes=SCOPES,
+        import os
+        import tempfile
+
+        if credentials_json and not os.path.exists(credentials_path):
+            info = _json.loads(credentials_json)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, dir="/tmp"
+            ) as f:
+                _json.dump(info, f)
+                credentials_path = f.name
+            logger.info("Google credentials written to temp file from JSON env var")
+        elif credentials_base64 and not os.path.exists(credentials_path):
+            import base64 as _b64
+            raw = _b64.b64decode(
+                credentials_base64 + "=" * (-len(credentials_base64) % 4)
             )
-            logger.info("Google credentials loaded from file: %s", credentials_path)
+            with tempfile.NamedTemporaryFile(
+                mode="wb", suffix=".json", delete=False, dir="/tmp"
+            ) as f:
+                f.write(raw)
+                credentials_path = f.name
+            logger.info("Google credentials written to temp file from base64 env var")
+
+        creds = Credentials.from_service_account_file(
+            credentials_path,
+            scopes=SCOPES,
+        )
         self._creds = creds
         self.gc = gspread.authorize(creds)
         self.spreadsheet_id = spreadsheet_id
         self._spreadsheet: gspread.Spreadsheet | None = None
+
+        # Кеш структуры листов: sheet_name → list[str] (заголовки)
+        self._cached_headers: dict[str, list[str]] = {}
+        # Результат последней валидации
+        self.schema_warnings: list[str] = []
+        self.schema_ok: bool = True
+
         logger.info("GoogleSheetsClient инициализирован (spreadsheet=%s)", spreadsheet_id)
 
     # ── Внутренние методы ───────────────────────────────────────────────
@@ -166,6 +254,101 @@ class GoogleSheetsClient:
         if self._spreadsheet is None:
             self._spreadsheet = self.gc.open_by_key(self.spreadsheet_id)
         return self._spreadsheet
+
+    # ── Валидация структуры листов ──────────────────────────────────────
+
+    def _sync_validate_sheets(self) -> tuple[bool, list[str]]:
+        """Проверяет заголовки всех критических листов против SHEET_SCHEMAS.
+
+        Returns:
+            (all_ok, warnings) — True если все обязательные колонки на месте,
+            список текстовых предупреждений для каждого несоответствия.
+        """
+        warnings: list[str] = []
+        all_ok = True
+        spreadsheet = self._get_spreadsheet()
+
+        for sheet_name, schema in SHEET_SCHEMAS.items():
+            try:
+                ws = spreadsheet.worksheet(sheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                # Необязательные листы (Рекомендации, Консультации) могут
+                # создаваться динамически — предупреждаем, но не фейлим.
+                warnings.append(f"⚠️ Лист «{sheet_name}» не найден в таблице")
+                logger.warning("Schema validation: лист '%s' отсутствует", sheet_name)
+                continue
+            except Exception as exc:
+                warnings.append(f"❌ Ошибка чтения листа «{sheet_name}»: {exc}")
+                logger.error("Schema validation error for '%s': %s", sheet_name, exc)
+                all_ok = False
+                continue
+
+            try:
+                header_raw = ws.row_values(1)
+            except Exception as exc:
+                warnings.append(f"❌ Не удалось прочитать заголовки «{sheet_name}»: {exc}")
+                all_ok = False
+                continue
+
+            header_lower = [h.strip().lower() for h in header_raw]
+
+            # Кешируем реальные заголовки
+            self._cached_headers[sheet_name] = header_raw
+
+            # Проверяем обязательные колонки
+            required = schema.get("required", [])
+            missing_req = [
+                col for col in required
+                if col.lower() not in header_lower
+            ]
+            if missing_req:
+                all_ok = False
+                msg = (
+                    f"❌ «{sheet_name}»: отсутствуют обязательные колонки: "
+                    f"{', '.join(missing_req)}"
+                )
+                warnings.append(msg)
+                logger.error("Schema drift: %s", msg)
+
+            # Проверяем опциональные (только предупреждение)
+            optional = schema.get("optional", [])
+            missing_opt = [
+                col for col in optional
+                if col.lower() not in header_lower
+            ]
+            if missing_opt:
+                msg = (
+                    f"⚠️ «{sheet_name}»: нет опциональных колонок: "
+                    f"{', '.join(missing_opt)}"
+                )
+                warnings.append(msg)
+                logger.warning("Schema note: %s", msg)
+
+            # Обнаруживаем неизвестные колонки (инфо)
+            known = {c.lower() for c in required + optional}
+            extra = [h for h in header_raw if h.strip() and h.strip().lower() not in known]
+            if extra:
+                logger.info(
+                    "Schema info: '%s' содержит дополнительные колонки: %s",
+                    sheet_name, ", ".join(extra),
+                )
+
+        return all_ok, warnings
+
+    async def validate_sheets(self) -> tuple[bool, list[str]]:
+        """Асинхронная валидация структуры листов.
+
+        Кеширует заголовки и возвращает (ok, warnings).
+        Используется при старте бота и по /health.
+        """
+        ok, warnings = await asyncio.to_thread(self._sync_validate_sheets)
+        self.schema_ok = ok
+        self.schema_warnings = warnings
+        return ok, warnings
+
+    def get_cached_headers(self, sheet_name: str) -> list[str] | None:
+        """Возвращает закешированные заголовки листа (после validate_sheets)."""
+        return self._cached_headers.get(sheet_name)
 
     # ── Каталог гайдов ──────────────────────────────────────────────────
 
@@ -351,34 +534,81 @@ class GoogleSheetsClient:
         # Обновляем аналитику после каждого лида
         asyncio.create_task(self.update_analytics())
 
+    # ── Обновление сферы бизнеса ──────────────────────────────────────────
+
+    @retry_sheets()
+    def _sync_update_lead_sphere(self, user_id: int, sphere: str) -> None:
+        """Обновляет колонку 'business_sphere' для лида в CRM.
+
+        Если колонки ещё нет — создаёт.
+        """
+        try:
+            ws = self._get_spreadsheet().worksheet(SHEET_LEADS)
+            all_rows = _safe_get_all_records(ws)
+            header = ws.row_values(1)
+
+            # Ищем (или создаём) колонку sphere
+            sphere_col = None
+            for i, h in enumerate(header, start=1):
+                if h.lower() in ("business_sphere", "сфера", "sphere"):
+                    sphere_col = i
+                    break
+            if sphere_col is None:
+                sphere_col = len(header) + 1
+                ws.update_cell(1, sphere_col, "business_sphere")
+
+            # Обновляем все строки пользователя
+            updated = 0
+            for idx, row in enumerate(all_rows, start=2):
+                if str(row.get("user_id", "")) == str(user_id):
+                    ws.update_cell(idx, sphere_col, sphere)
+                    updated += 1
+
+            if updated:
+                logger.info(
+                    "CRM sphere updated: user_id=%s, sphere='%s', rows=%d",
+                    user_id, sphere[:50], updated,
+                )
+        except Exception as e:
+            logger.error("Ошибка обновления sphere в CRM: %s", e)
+
+    async def update_lead_sphere(self, user_id: int, sphere: str) -> None:
+        """Асинхронно обновляет сферу бизнеса лида в Google Sheets."""
+        await asyncio.to_thread(self._sync_update_lead_sphere, user_id, sphere)
+
     # ── Авто-серия follow-up ────────────────────────────────────────────
 
     @retry_sheets()
-    def _sync_get_followup_series(self) -> dict[str, str]:
-        """Синхронное чтение листа «Авто-серия»."""
+    def _sync_get_followup_series(self) -> list[dict]:
+        """Синхронное чтение листа «Авто-серия» как list[dict].
+
+        Каждая строка содержит: key, text, content_url, content_type, button_text.
+        """
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_FOLLOWUP)
             rows = _safe_get_all_records(ws)
-            texts = {
-                str(row.get("key", "")): str(row.get("text", ""))
-                for row in rows
-                if row.get("key")
-            }
-            logger.info("Загружено %d текстов авто-серии из Sheets", len(texts))
-            return texts
+            result = [row for row in rows if row.get("key")]
+            logger.info("Загружено %d записей авто-серии из Sheets", len(result))
+            return result
         except gspread.exceptions.WorksheetNotFound:
             logger.warning("Лист '%s' не найден — используются fallback-тексты", SHEET_FOLLOWUP)
-            return {}
+            return []
         except Exception as e:
             logger.error("Ошибка чтения авто-серии: %s", e)
-            return {}
+            return []
 
-    async def get_followup_series(self) -> dict[str, str]:
-        """Асинхронное чтение текстов авто-серии.
+    async def get_followup_series(self) -> list[dict]:
+        """Асинхронное чтение записей авто-серии.
 
         Returns:
-            Словарь ``{key: text}``, ключи формата ``step_1``, ``step_2``, ``step_3``
-            или ``{guide_id}_step_{N}`` для гайд-специфичных текстов.
+            Список словарей. Каждая строка может содержать:
+            - ``key``: ключ (``step_0``, ``step_1``, ``step_2``,
+              или ``{guide_id}_step_{N}`` для гайд-специфичных,
+              или ``{sphere}_step_{N}`` для сфер-специфичных).
+            - ``text``: основной текст сообщения (HTML).
+            - ``content_url``: ссылка на контент (статья, чек-лист).
+            - ``content_type``: тип контента (checklist, article, webinar).
+            - ``button_text``: текст кнопки для ``content_url``.
         """
         return await asyncio.to_thread(self._sync_get_followup_series)
 
@@ -808,6 +1038,16 @@ class GoogleSheetsClient:
         """Возвращает список статей."""
         return await asyncio.to_thread(self._sync_get_articles_list, limit)
 
+    async def get_article_by_id(self, article_id: str) -> dict | None:
+        """Ищет статью по id/slug среди всех записей."""
+        articles = await self.get_articles_list(limit=200)
+        slug_lower = article_id.lower().replace("-", " ")
+        for art in articles:
+            aid = str(art.get("id", art.get("article_id", ""))).lower()
+            if aid == article_id.lower() or aid.replace("-", " ") == slug_lower:
+                return art
+        return None
+
     @retry_sheets()
     def _sync_toggle_article(self, article_id: str) -> bool:
         """Переключает active для статьи. Возвращает новое состояние."""
@@ -918,6 +1158,38 @@ class GoogleSheetsClient:
     async def get_consult_log(self, limit: int = 100) -> list[dict]:
         return await asyncio.to_thread(self._sync_get_consult_log, limit)
 
+    # ── Консультации (заявки на звонок) ──────────────────────────────────
+
+    @retry_sheets()
+    def _sync_append_consultation(self, row: list) -> None:
+        try:
+            ws = self._get_spreadsheet().worksheet(SHEET_CONSULTATIONS)
+            ws.append_row(row, value_input_option="USER_ENTERED")
+        except gspread.exceptions.WorksheetNotFound:
+            spreadsheet = self._get_spreadsheet()
+            ws = spreadsheet.add_worksheet(title=SHEET_CONSULTATIONS, rows=100, cols=8)
+            ws.append_row(
+                ["Дата", "User ID", "Username", "Имя", "Email", "Телефон", "Удобное время", "Статус"],
+                value_input_option="USER_ENTERED",
+            )
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            logger.info("Лист '%s' создан автоматически", SHEET_CONSULTATIONS)
+
+    async def append_consultation(
+        self,
+        *,
+        user_id: int,
+        username: str,
+        name: str,
+        email: str,
+        phone: str,
+        preferred_time: str,
+    ) -> None:
+        """Сохраняет заявку на консультацию."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        row = [now, str(user_id), username, name, email, phone, preferred_time, "Новая"]
+        await asyncio.to_thread(self._sync_append_consultation, row)
+
     # ── Content Calendar ─────────────────────────────────────────────────
 
     @retry_sheets()
@@ -949,6 +1221,165 @@ class GoogleSheetsClient:
 
     async def get_content_calendar(self) -> list[dict]:
         return await asyncio.to_thread(self._sync_get_content_calendar)
+
+    # ── Рекомендации (маппинг гайд → следующий гайд / статья) ──────────
+
+    @retry_sheets()
+    def _sync_get_recommendations(self) -> dict:
+        """Читает лист 'Рекомендации': guide_id → {next_guide_id, next_article_link, message}."""
+        try:
+            ws = self._get_spreadsheet().worksheet(SHEET_RECOMMENDATIONS)
+            rows = _safe_get_all_records(ws)
+            mapping = {}
+            for row in rows:
+                gid = str(row.get("guide_id", row.get("id", ""))).strip()
+                if gid:
+                    mapping[gid] = {
+                        "next_guide_id": str(row.get("next_guide_id", "")).strip(),
+                        "next_article_link": str(row.get("next_article_link", "")).strip(),
+                        "message": str(row.get("message", "")).strip(),
+                    }
+            return mapping
+        except gspread.exceptions.WorksheetNotFound:
+            logger.info("Лист '%s' не найден — рекомендации отключены", SHEET_RECOMMENDATIONS)
+            return {}
+        except Exception as e:
+            logger.error("Ошибка чтения рекомендаций: %s", e)
+            return {}
+
+    async def get_recommendations(self) -> dict:
+        """Возвращает маппинг рекомендаций."""
+        return await asyncio.to_thread(self._sync_get_recommendations)
+
+    @retry_sheets()
+    def _sync_update_recommendations_sheet(self, mapping: dict[str, str]) -> None:
+        """Обновляет/создаёт записи в листе «Рекомендации» на основе smart rec.
+
+        Сохраняет существующие next_article_link и message, обновляет только
+        next_guide_id.
+        """
+        try:
+            ws = self._get_spreadsheet().worksheet(SHEET_RECOMMENDATIONS)
+        except gspread.exceptions.WorksheetNotFound:
+            spreadsheet = self._get_spreadsheet()
+            ws = spreadsheet.add_worksheet(title=SHEET_RECOMMENDATIONS, rows=100, cols=4)
+            ws.append_row(
+                ["guide_id", "next_guide_id", "next_article_link", "message"],
+                value_input_option="USER_ENTERED",
+            )
+            logger.info("Лист '%s' создан автоматически", SHEET_RECOMMENDATIONS)
+
+        rows = _safe_get_all_records(ws)
+        existing: dict[str, int] = {}  # guide_id → row_number (1-indexed, +2 for header)
+        header = ws.row_values(1)
+
+        # Находим колонку next_guide_id
+        next_col = None
+        for i, h in enumerate(header, start=1):
+            if h.strip().lower() == "next_guide_id":
+                next_col = i
+                break
+
+        if next_col is None:
+            next_col = 2  # default position
+
+        for idx, row in enumerate(rows, start=2):
+            gid = str(row.get("guide_id", row.get("id", ""))).strip()
+            if gid:
+                existing[gid] = idx
+
+        updated = 0
+        created = 0
+        for guide_id, next_guide_id in mapping.items():
+            if guide_id in existing:
+                ws.update_cell(existing[guide_id], next_col, next_guide_id)
+                updated += 1
+            else:
+                ws.append_row(
+                    [guide_id, next_guide_id, "", ""],
+                    value_input_option="USER_ENTERED",
+                )
+                created += 1
+
+        logger.info(
+            "Recommendations sheet synced: %d updated, %d created",
+            updated, created,
+        )
+
+    async def update_recommendations_sheet(self, mapping: dict[str, str]) -> None:
+        """Обновляет лист Рекомендации из smart rec матрицы."""
+        await asyncio.to_thread(self._sync_update_recommendations_sheet, mapping)
+
+    # ── Вопросы пользователей ────────────────────────────────────────────
+
+    @retry_sheets()
+    def _sync_append_question(self, row: list) -> None:
+        try:
+            ws = self._get_spreadsheet().worksheet(SHEET_QUESTIONS)
+            ws.append_row(row, value_input_option="USER_ENTERED")
+        except gspread.exceptions.WorksheetNotFound:
+            spreadsheet = self._get_spreadsheet()
+            ws = spreadsheet.add_worksheet(title=SHEET_QUESTIONS, rows=200, cols=8)
+            ws.append_row(
+                ["Дата", "User ID", "Username", "Имя", "Сфера", "Вопрос", "Ответ", "Статус"],
+                value_input_option="USER_ENTERED",
+            )
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            logger.info("Лист '%s' создан автоматически", SHEET_QUESTIONS)
+
+    async def append_question(
+        self,
+        *,
+        user_id: int,
+        username: str,
+        name: str,
+        question: str,
+    ) -> None:
+        """Сохраняет вопрос пользователя в Sheets."""
+        from src.database.crud import get_lead_by_user_id
+        lead = await get_lead_by_user_id(user_id)
+        sphere = getattr(lead, "business_sphere", "") or "" if lead else ""
+        lead_name = lead.name if lead else name
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        row = [now, str(user_id), username, lead_name, sphere, question[:500], "", "Новый"]
+        await asyncio.to_thread(self._sync_append_question, row)
+
+    @retry_sheets()
+    def _sync_update_question_answer(self, question_id: int, answer: str) -> None:
+        """Обновляет ответ и статус в листе Вопросы (ищет по тексту ID в строках)."""
+        try:
+            ws = self._get_spreadsheet().worksheet(SHEET_QUESTIONS)
+            rows = _safe_get_all_records(ws)
+            header = ws.row_values(1)
+
+            answer_col = None
+            status_col = None
+            for i, h in enumerate(header, start=1):
+                hl = h.strip().lower()
+                if hl in ("ответ", "answer"):
+                    answer_col = i
+                if hl in ("статус", "status"):
+                    status_col = i
+
+            if answer_col is None:
+                answer_col = 7
+            if status_col is None:
+                status_col = 8
+
+            # Обновляем последнюю строку со статусом "Новый"
+            for idx in range(len(rows) - 1, -1, -1):
+                if str(rows[idx].get("Статус", "")).strip() == "Новый":
+                    ws.update_cell(idx + 2, answer_col, answer[:500])
+                    ws.update_cell(idx + 2, status_col, "Отвечен")
+                    break
+
+        except Exception as e:
+            logger.error("Error updating question answer in Sheets: %s", e)
+
+    async def update_question_answer(self, question_id: int, answer: str) -> None:
+        """Обновляет ответ на вопрос в Sheets."""
+        await asyncio.to_thread(self._sync_update_question_answer, question_id, answer)
 
     # ── Lead Scoring ─────────────────────────────────────────────────────
 
@@ -989,3 +1420,43 @@ class GoogleSheetsClient:
     async def update_lead_score(self, user_id: int, score: int, label: str) -> None:
         """Асинхронно обновляет скоринг лида."""
         await asyncio.to_thread(self._sync_update_lead_score, user_id, score, label)
+
+    # ── Лог email-кампаний ────────────────────────────────────────────────
+
+    @retry_sheets()
+    def _sync_log_email_campaign(self, row: list) -> None:
+        """Записывает лог кампании в лист «Email Campaigns»."""
+        try:
+            spreadsheet = self._get_spreadsheet()
+            try:
+                ws = spreadsheet.worksheet("Email Campaigns")
+            except gspread.exceptions.WorksheetNotFound:
+                ws = spreadsheet.add_worksheet(
+                    title="Email Campaigns", rows=100, cols=8,
+                )
+                ws.append_row(
+                    ["timestamp", "campaign_id", "segment", "guide_id",
+                     "total", "sent", "failed", "status"],
+                    value_input_option="USER_ENTERED",
+                )
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            logger.info("Email campaign logged to Sheets")
+        except Exception as e:
+            logger.error("Email campaign log error: %s", e)
+
+    async def log_email_campaign(
+        self,
+        *,
+        campaign_id: str,
+        segment: str,
+        guide_id: str,
+        total: int,
+        sent: int,
+        failed: int,
+    ) -> None:
+        """Логирует email-кампанию в Google Sheets."""
+        from datetime import datetime, timezone as tz
+        now = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M:%S")
+        status = "OK" if failed == 0 else f"PARTIAL ({failed} errors)"
+        row = [now, campaign_id, segment, guide_id, str(total), str(sent), str(failed), status]
+        await asyncio.to_thread(self._sync_log_email_campaign, row)
