@@ -214,7 +214,7 @@ def _get_freshness_line(guide_info: dict, download_count: int) -> str:
     """Возвращает строку «свежести» гайда.
 
     Если у гайда есть поле ``is_new`` или ``new`` = true — отдаёт «только вышел».
-    Иначе — отдаёт счётчик скачиваний.
+    Иначе — отдаёт счётчик скачиваний (FOMO).
     """
     is_new = str(guide_info.get("is_new", guide_info.get("new", ""))).strip().lower()
 
@@ -227,8 +227,12 @@ def _get_freshness_line(guide_info: dict, download_count: int) -> str:
             )
         return "🆕 Этот гайд совсем новый — будьте среди первых, кто его получит."
 
+    if download_count >= 50:
+        return f"📊 Уже <b>{_humanize_count(download_count)}</b> предпринимателей скачали этот гайд."
     if download_count >= 10:
         return f"📊 Уже {_humanize_count(download_count)} предпринимателей использовали эту информацию."
+    if download_count >= 3:
+        return f"📊 Этот гайд уже скачали {download_count} предпринимателей."
 
     return ""
 
@@ -542,19 +546,25 @@ async def _build_whats_next(
 
     if next_guide:
         next_title = next_guide.get("title", next_gid)
+
+        # Счётчик скачиваний рекомендованного гайда
+        from src.database.crud import count_guide_downloads
+        next_dl = await count_guide_downloads(next_gid) if next_gid else 0
+        dl_tag = f" · скачали {_humanize_count(next_dl)}+ чел." if next_dl >= 5 else ""
+
         if rec_source == "sphere" and sphere:
             parts.append(
                 f"\n📚 <b>Для {_esc_html(sphere)}-бизнеса рекомендуем:</b> "
-                f"«{_esc_html(next_title)}»"
+                f"«{_esc_html(next_title)}»{dl_tag}"
             )
         elif has_sphere and sphere:
             parts.append(
                 f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}» "
-                f"(для сферы «{_esc_html(sphere)}»)"
+                f"(для сферы «{_esc_html(sphere)}»){dl_tag}"
             )
         else:
             parts.append(
-                f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}»"
+                f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}»{dl_tag}"
             )
 
     scarcity = await _get_consult_scarcity_line()
@@ -1528,11 +1538,24 @@ async def noop_handler(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-def _build_category_snippet(guides: list[dict], page: int = 0, page_size: int = 3) -> str:
-    """Формирует текст с мини-описаниями гайдов на текущей странице."""
-    start = page * page_size
-    end = start + page_size
-    page_items = guides[start:end]
+async def _build_category_snippet(
+    guides: list[dict],
+    page: int = 0,
+    page_size: int = 3,
+) -> str:
+    """Формирует текст с мини-описаниями гайдов на текущей странице.
+
+    Включает счётчик скачиваний из БД для социального доказательства.
+    """
+    from src.database.crud import count_guide_downloads_bulk
+
+    start_idx = page * page_size
+    end_idx = start_idx + page_size
+    page_items = guides[start_idx:end_idx]
+
+    # Получаем счётчики скачиваний одним запросом
+    guide_ids = [str(g.get("id", "")) for g in page_items if g.get("id")]
+    dl_counts = await count_guide_downloads_bulk(guide_ids) if guide_ids else {}
 
     parts = []
     for g in page_items:
@@ -1540,6 +1563,7 @@ def _build_category_snippet(guides: list[dict], page: int = 0, page_size: int = 
         desc = g.get("description", "")
         pages = str(g.get("pages", "")).strip()
         highlights = g.get("highlights", "")
+        gid = str(g.get("id", ""))
 
         line = f"📄 <b>{_esc_html(title)}</b>"
 
@@ -1556,9 +1580,15 @@ def _build_category_snippet(guides: list[dict], page: int = 0, page_size: int = 
                 shown = items[:3]
                 line += "\n" + ", ".join(_esc_html(i) for i in shown)
 
-        # Страницы
+        # Метаданные: страницы + скачивания
+        meta = []
         if pages:
-            line += f"  · {_esc_html(pages)} стр."
+            meta.append(f"{_esc_html(pages)} стр.")
+        dl = dl_counts.get(gid, 0)
+        if dl >= 5:
+            meta.append(f"скачали {_humanize_count(dl)}+ чел.")
+        if meta:
+            line += "  · " + " · ".join(meta)
 
         parts.append(line)
 
@@ -1592,8 +1622,8 @@ async def show_category_guides(
     cat_name = filtered[0].get("category", "Гайды")
     await state.update_data(current_category=cat_slug)
 
-    # Мини-описания гайдов на первой странице
-    snippet = _build_category_snippet(filtered, page=0)
+    # Мини-описания гайдов на первой странице (с счётчиками скачиваний)
+    snippet = await _build_category_snippet(filtered, page=0)
 
     prefix = f"cpage_{cat_slug}"
     header = f"📂 <b>{cat_name}</b>\n\n{snippet}\n\n<i>Нажмите на гайд для подробностей:</i>"
@@ -1615,7 +1645,7 @@ async def navigate_category_guides(
     google: GoogleSheetsClient,
     cache: TTLCache,
 ) -> None:
-    """Переключает страницу внутри категории."""
+    """Переключает страницу внутри категории (текст + клавиатура)."""
     raw = callback.data.removeprefix("cpage_")
     parts = raw.rsplit("_", 1)
     if len(parts) != 2:
@@ -1635,9 +1665,14 @@ async def navigate_category_guides(
         await callback.answer("Нет гайдов.", show_alert=True)
         return
 
+    cat_name = filtered[0].get("category", "Гайды")
+    snippet = await _build_category_snippet(filtered, page=page)
     prefix = f"cpage_{cat_slug}"
+    header = f"📂 <b>{cat_name}</b>\n\n{snippet}\n\n<i>Нажмите на гайд для подробностей:</i>"
+
     try:
-        await callback.message.edit_reply_markup(
+        await callback.message.edit_text(
+            header,
             reply_markup=paginated_guides_keyboard(
                 filtered, page=page,
                 prefix=prefix,

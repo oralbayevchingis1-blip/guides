@@ -158,14 +158,21 @@ async def guides_list(
     bot_info = await bot.get_me()
     bot_username = bot_info.username
 
+    # Получаем счётчики скачиваний одним запросом
+    from src.database.crud import count_guide_downloads_bulk
+    guide_ids = [str(g.get("id", "")) for g in catalog if g.get("id")]
+    dl_counts = await count_guide_downloads_bulk(guide_ids) if guide_ids else {}
+
     text = "📚 <b>Каталог гайдов:</b>\n\n"
     buttons = []
     for g in catalog:
         gid = g.get("id", "?")
         title = g.get("title", gid)[:35]
         deep_link = f"https://t.me/{bot_username}?start=guide_{gid}"
+        dl = dl_counts.get(gid, 0)
         text += (
-            f"📄 <b>{title}</b>\n"
+            f"📄 <b>{title}</b>"
+            f" · 📊 {dl} скач.\n"
             f"   🆔 <code>{gid}</code>\n"
             f"   🔗 <code>{deep_link}</code>\n\n"
         )
