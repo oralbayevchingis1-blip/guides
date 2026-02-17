@@ -215,6 +215,30 @@ class FunnelEvent(Base):
         return f"<FunnelEvent(user={self.user_id}, step={self.step})>"
 
 
+class Referral(Base):
+    """Реферальная связь: кто кого пригласил."""
+
+    __tablename__ = "referrals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    referrer_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    referred_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    referred_downloaded: Mapped[bool] = mapped_column(Boolean, default=False)
+    reward_given: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_referrals_referrer", "referrer_id"),
+        Index("ix_referrals_referred", "referred_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Referral(referrer={self.referrer_id}, referred={self.referred_id})>"
+
+
 # ──────────────────────── Инициализация ─────────────────────────────────
 
 async def init_db() -> None:

@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy import func as sa_func
 
-from src.database.models import ConsentLog, FunnelEvent, Lead, Question, ScheduledTask, TopicSubscription, User, async_session
+from src.database.models import ConsentLog, FunnelEvent, Lead, Question, Referral, ScheduledTask, TopicSubscription, User, async_session
 
 logger = logging.getLogger(__name__)
 
@@ -959,12 +959,92 @@ async def get_funnel_by_source(hours: int = 168) -> dict[str, dict[str, int]]:
     return dict(data)
 
 
-# ──────────────────── Backward-compat stubs ──────────────────────────────
+# ──────────────────── Referrals ──────────────────────────────────────────
+
+
+async def save_referral(referrer_id: int, referred_id: int) -> bool:
+    """Сохраняет реферальную связь. Возвращает True, если новая."""
+    if referrer_id == referred_id:
+        return False
+    try:
+        async with async_session() as session:
+            existing = await session.execute(
+                select(Referral).where(Referral.referred_id == referred_id)
+            )
+            if existing.scalar_one_or_none():
+                return False
+            ref = Referral(referrer_id=referrer_id, referred_id=referred_id)
+            session.add(ref)
+            await session.commit()
+            logger.info("Referral saved: %s -> %s", referrer_id, referred_id)
+            return True
+    except Exception as e:
+        logger.warning("save_referral error: %s", e)
+        return False
 
 
 async def count_referrals(user_id: int) -> int:
-    """Count referrals for a user (stub — referral table not yet created)."""
-    return 0
+    """Количество приглашённых пользователем людей."""
+    async with async_session() as session:
+        stmt = select(sa_func.count()).select_from(Referral).where(
+            Referral.referrer_id == user_id
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one() or 0
+
+
+async def count_referral_downloads(user_id: int) -> int:
+    """Количество приглашённых, которые скачали хотя бы один гайд."""
+    async with async_session() as session:
+        stmt = select(sa_func.count()).select_from(Referral).where(
+            Referral.referrer_id == user_id,
+            Referral.referred_downloaded == True,
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one() or 0
+
+
+async def get_referrer_id(user_id: int) -> int | None:
+    """Возвращает referrer_id для данного пользователя (или None)."""
+    async with async_session() as session:
+        stmt = select(Referral.referrer_id).where(Referral.referred_id == user_id)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+
+async def mark_referral_downloaded(referred_id: int) -> int | None:
+    """Помечает, что приглашённый скачал гайд. Возвращает referrer_id (или None)."""
+    async with async_session() as session:
+        stmt = select(Referral).where(
+            Referral.referred_id == referred_id,
+            Referral.referred_downloaded == False,
+        )
+        result = await session.execute(stmt)
+        ref = result.scalar_one_or_none()
+        if not ref:
+            return None
+        ref.referred_downloaded = True
+        await session.commit()
+        logger.info("Referral download marked: referred=%s, referrer=%s", referred_id, ref.referrer_id)
+        return ref.referrer_id
+
+
+async def get_referral_stats(user_id: int) -> dict[str, int]:
+    """Полная статистика рефералов для пользователя."""
+    invited = await count_referrals(user_id)
+    downloaded = await count_referral_downloads(user_id)
+    return {
+        "invited": invited,
+        "downloaded": downloaded,
+    }
+
+
+async def mark_referral_rewarded(referrer_id: int, milestone: int) -> None:
+    """Помечает выданную награду для рефералов (через meta в FunnelEvent)."""
+    await track(
+        referrer_id, "referral_reward",
+        meta=json.dumps({"milestone": milestone}),
+    )
 
 
 async def get_leads_by_user(user_id: int) -> list:
@@ -973,9 +1053,3 @@ async def get_leads_by_user(user_id: int) -> list:
         stmt = select(Lead).where(Lead.user_id == user_id)
         result = await session.execute(stmt)
         return list(result.scalars().all())
-
-
-async def save_referral(referrer_id: int, referred_id: int) -> bool:
-    """Save a referral relationship (stub)."""
-    logger.info("Referral: %s -> %s (stub)", referrer_id, referred_id)
-    return True

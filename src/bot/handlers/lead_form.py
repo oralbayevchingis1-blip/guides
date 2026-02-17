@@ -606,6 +606,110 @@ async def _build_whats_next(
     return text, kb
 
 
+# ──────────────────────── Реферальные награды ────────────────────────────
+
+# Milestones: при N скачиваниях от приглашённых → награда
+_REFERRAL_MILESTONES: dict[int, str] = {
+    1: (
+        "🎉 <b>Ваш друг скачал первый гайд!</b>\n\n"
+        "Спасибо, что делитесь полезными материалами. "
+        "Пригласите ещё 2 друзей — и получите доступ "
+        "к подборке из 3 эксклюзивных гайдов по вашей теме."
+    ),
+    3: (
+        "🏆 <b>3 друга скачали гайды!</b>\n\n"
+        "Отличный результат! Вы заработали доступ "
+        "к <b>закрытой подборке</b> из 3 гайдов по вашей теме.\n"
+        "Нажмите кнопку ниже, чтобы получить бонус."
+    ),
+    5: (
+        "🌟 <b>5 друзей в боте!</b>\n\n"
+        "Вы — настоящий амбассадор! Мы дарим вам "
+        "<b>бесплатную 30-минутную консультацию</b> "
+        "с юристом SOLIS Partners.\n"
+        "Нажмите кнопку, чтобы записаться."
+    ),
+}
+
+
+async def _notify_referrer_on_download(
+    referred_id: int,
+    guide_id: str,
+    bot: "Bot",
+) -> None:
+    """Уведомляет реферера, когда его друг скачивает гайд.
+
+    Проверяет milestones и выдаёт награды.
+    """
+    try:
+        from src.database.crud import (
+            mark_referral_downloaded,
+            count_referral_downloads,
+            mark_referral_rewarded,
+        )
+
+        referrer_id = await mark_referral_downloaded(referred_id)
+        if not referrer_id:
+            return
+
+        dl_count = await count_referral_downloads(referrer_id)
+
+        # Проверяем milestone
+        milestone_text = _REFERRAL_MILESTONES.get(dl_count)
+        if milestone_text:
+            await mark_referral_rewarded(referrer_id, dl_count)
+
+            buttons: list[list[InlineKeyboardButton]] = []
+            if dl_count >= 5:
+                buttons.append([InlineKeyboardButton(
+                    text="📞 Записаться на бесплатную консультацию",
+                    callback_data="book_consultation",
+                )])
+            elif dl_count >= 3:
+                buttons.append([InlineKeyboardButton(
+                    text="🎁 Получить бонусные гайды",
+                    callback_data="show_categories",
+                )])
+
+            buttons.append([InlineKeyboardButton(
+                text="🔗 Пригласить ещё",
+                callback_data=f"share_bot_{referrer_id}",
+            )])
+
+            await bot.send_message(
+                referrer_id,
+                milestone_text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            )
+        else:
+            # Обычное уведомление (не milestone)
+            remaining_to_3 = max(0, 3 - dl_count)
+            if remaining_to_3 > 0:
+                nudge = f"Ещё {remaining_to_3} — и вы получите бонусные гайды!"
+            else:
+                remaining_to_5 = max(0, 5 - dl_count)
+                if remaining_to_5 > 0:
+                    nudge = f"Ещё {remaining_to_5} — и вы получите бесплатную консультацию!"
+                else:
+                    nudge = "Продолжайте делиться!"
+
+            await bot.send_message(
+                referrer_id,
+                f"👥 Ваш друг только что скачал гайд в боте!\n\n"
+                f"Уже <b>{dl_count}</b> из ваших приглашённых "
+                f"получили гайды. {nudge}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="🔗 Пригласить ещё",
+                        callback_data=f"share_bot_{referrer_id}",
+                    )],
+                ]),
+            )
+
+    except Exception as e:
+        logger.warning("Referral notify error: %s", e)
+
+
 # ──────────────────────── Скачивание гайда (шаг 2) ───────────────────────
 
 
@@ -757,6 +861,10 @@ async def process_guide_download(
         )
         metrics.inc_error("pdf_unavailable")
         logger.warning("PDF не доступен для гайда '%s' (drive_file_id='%s')", guide_id, file_id)
+
+    # Referral: уведомляем того, кто пригласил
+    if pdf_sent:
+        asyncio.create_task(_notify_referrer_on_download(user_id, guide_id, bot))
 
     # existing_lead уже проверен выше (барьер 2) — перечитываем на случай race condition
     existing_lead = await get_lead_by_user_id(user_id)
@@ -1690,16 +1798,46 @@ async def send_case_detail(
 
 @router.callback_query(F.data.startswith("share_bot_"))
 async def share_bot(callback: CallbackQuery, bot: Bot) -> None:
-    """Генерирует реферальную ссылку с UTM-меткой для отслеживания."""
-    user_id = callback.data.removeprefix("share_bot_")
+    """Генерирует реферальную ссылку с наградной программой."""
+    user_id_str = callback.data.removeprefix("share_bot_")
+    try:
+        user_id_int = int(user_id_str)
+    except (ValueError, TypeError):
+        user_id_int = callback.from_user.id
+
     bot_info = await bot.get_me()
-    share_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}--referral"
+    share_link = f"https://t.me/{bot_info.username}?start=ref_{user_id_int}--referral"
+
+    # Статистика рефералов
+    from src.database.crud import get_referral_stats
+    stats = await get_referral_stats(user_id_int)
+    invited = stats["invited"]
+    downloaded = stats["downloaded"]
+
+    # Прогресс к следующей награде
+    if downloaded < 3:
+        remaining = 3 - downloaded
+        reward_line = f"📦 Пригласите {remaining} друзей → <b>бонусная подборка гайдов</b>"
+    elif downloaded < 5:
+        remaining = 5 - downloaded
+        reward_line = f"📞 Ещё {remaining} друзей → <b>бесплатная консультация юриста</b>"
+    else:
+        reward_line = "🌟 Вы — амбассадор! Все награды получены."
+
+    stats_line = ""
+    if invited > 0:
+        stats_line = (
+            f"\n📊 <b>Ваши рефералы:</b> "
+            f"{invited} приглашённых, {downloaded} скачали гайды\n"
+        )
 
     share_text = (
-        "🔗 <b>Поделитесь с коллегами!</b>\n\n"
+        "🔗 <b>Пригласите коллег — получите бонус!</b>\n\n"
+        f"{reward_line}\n"
+        f"{stats_line}\n"
         "Бесплатные PDF-гайды от SOLIS Partners: налоговая "
         "оптимизация, IT-право, инвестиции и M&A в Казахстане.\n\n"
-        "Перешлите это сообщение или скопируйте ссылку:\n\n"
+        "Перешлите сообщение или скопируйте ссылку:\n\n"
         f"<code>{share_link}</code>"
     )
 
@@ -1708,7 +1846,78 @@ async def share_bot(callback: CallbackQuery, bot: Bot) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="📤 Переслать другу",
-                switch_inline_query=f"Бесплатные юридические гайды для бизнеса в Казахстане — забирай: {share_link}",
+                switch_inline_query=f"Бесплатные юридические гайды для бизнеса — забирай: {share_link}",
+            )],
+            [InlineKeyboardButton(
+                text="📊 Мои рефералы",
+                callback_data="my_referrals",
+            )],
+            [InlineKeyboardButton(text="🔹 Назад к темам", callback_data="show_categories")],
+        ]),
+    )
+    await callback.answer()
+
+
+# ──────────────────────── Реферальная статистика ──────────────────────────
+
+
+@router.callback_query(F.data == "my_referrals")
+async def my_referrals(callback: CallbackQuery, bot: Bot) -> None:
+    """Показывает реферальную статистику пользователя."""
+    user_id = callback.from_user.id
+
+    from src.database.crud import get_referral_stats
+    stats = await get_referral_stats(user_id)
+    invited = stats["invited"]
+    downloaded = stats["downloaded"]
+
+    bot_info = await bot.get_me()
+    share_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}--referral"
+
+    # Прогресс-бар к следующей награде
+    if downloaded < 3:
+        target = 3
+        reward = "подборка из 3 бонусных гайдов"
+        bar_filled = downloaded
+        bar_total = 3
+    elif downloaded < 5:
+        target = 5
+        reward = "бесплатная консультация юриста"
+        bar_filled = downloaded - 3
+        bar_total = 2
+    else:
+        target = 0
+        reward = ""
+        bar_filled = bar_total = 0
+
+    lines = [
+        "📊 <b>Ваша реферальная программа</b>\n",
+        f"👥 Приглашено: <b>{invited}</b>",
+        f"📥 Скачали гайд: <b>{downloaded}</b>",
+    ]
+
+    if target:
+        filled = "█" * bar_filled
+        empty = "░" * (bar_total - bar_filled)
+        lines.append(
+            f"\n🎯 До награды: {filled}{empty} "
+            f"({downloaded}/{target})"
+        )
+        lines.append(f"🎁 Награда: <b>{reward}</b>")
+    else:
+        lines.append("\n🌟 Все награды получены! Спасибо, что делитесь!")
+
+    lines.append(
+        "\n\n🔗 <b>Ваша ссылка:</b>\n"
+        f"<code>{share_link}</code>"
+    )
+
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📤 Пригласить друга",
+                switch_inline_query=f"Бесплатные юридические гайды для бизнеса — забирай: {share_link}",
             )],
             [InlineKeyboardButton(text="🔹 Назад к темам", callback_data="show_categories")],
         ]),

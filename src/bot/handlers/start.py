@@ -330,21 +330,30 @@ async def cmd_start(
 
     # ── Deep Link: реферал (ref_{user_id}) ──────────────────────────
     if clean_args.startswith("ref_"):
-        referrer_id = clean_args.removeprefix("ref_")
-        logger.info("Referral deep link: user=%s, referrer=%s, utm_src=%s", user.id, referrer_id, utm.source)
+        referrer_id_str = clean_args.removeprefix("ref_")
+        logger.info("Referral deep link: user=%s, referrer=%s, utm_src=%s", user.id, referrer_id_str, utm.source)
 
         await get_or_create_user(
             user_id=user.id, username=user.username, full_name=user.full_name,
-            traffic_source=source_str or f"ref_{referrer_id}",
+            traffic_source=source_str or f"ref_{referrer_id_str}",
         )
         await state.clear()
-        await state.update_data(traffic_source=source_str or f"ref_{referrer_id}")
+        await state.update_data(traffic_source=source_str or f"ref_{referrer_id_str}")
 
         asyncio.create_task(track(
             user.id, "deeplink_referral",
-            source=source_str or f"ref_{referrer_id}",
+            source=source_str or f"ref_{referrer_id_str}",
             meta=_utm_json(utm),
         ))
+
+        # Сохраняем реферальную связь
+        try:
+            from src.database.crud import save_referral
+            ref_id = int(referrer_id_str)
+            if ref_id != user.id:
+                asyncio.create_task(save_referral(ref_id, user.id))
+        except (ValueError, TypeError):
+            logger.warning("Invalid referrer_id in deep link: %s", referrer_id_str)
 
     # ── Стандартный /start flow ───────────────────────────────────────
     # Value-first: сразу показываем категории гайдов.
