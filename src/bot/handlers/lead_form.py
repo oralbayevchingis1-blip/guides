@@ -499,13 +499,30 @@ async def process_guide_download(
         asyncio.create_task(track(user_id, "sub_prompt", guide_id=guide_id))
         guide_title = guide_info.get("title", guide_id)
         channel = settings.CHANNEL_USERNAME
+
+        # Персонализация по теме гайда
+        guide_category = guide_info.get("category", "").lower()
+        if "налог" in guide_category or "tax" in guide_category:
+            topic_hook = "изменения в налоговом законодательстве"
+        elif "труд" in guide_category or "labor" in guide_category:
+            topic_hook = "обновления трудового права"
+        elif "it" in guide_category or "ит" in guide_category:
+            topic_hook = "IT-льготы и цифровое право"
+        elif "инвест" in guide_category or "m&a" in guide_category:
+            topic_hook = "инвестиционное право и M&A"
+        else:
+            topic_hook = "изменения в законодательстве"
+
         await callback.answer()
         await callback.message.answer(
             f"📚 Вы на шаг от получения гайда «{guide_title}»!\n\n"
-            f"В нашем канале {channel} мы публикуем обновления "
-            "законов, судебную практику и анонсы новых гайдов.\n\n"
+            f"В нашем канале {channel} мы публикуем:\n"
+            f"  📌 {topic_hook}\n"
+            "  📌 разборы судебной практики\n"
+            "  📌 анонсы новых гайдов и чек-листов\n\n"
             "Подпишитесь — и будете в курсе изменений, "
-            "которые касаются вашего бизнеса 👇",
+            "которые касаются вашего бизнеса.\n\n"
+            "<i>Это бесплатно и займёт 2 секунды</i> 👇",
             reply_markup=subscription_keyboard(),
         )
         return

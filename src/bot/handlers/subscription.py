@@ -46,8 +46,11 @@ async def check_subscription_callback(
         fail_text = get_text(texts, "subscription_fail")
         if not fail_text or fail_text == "subscription_fail":
             fail_text = (
-                "Подписка пока не найдена. Нажмите «Подписаться на канал» "
-                "выше, подпишитесь и вернитесь сюда — я проверю ещё раз."
+                "Подписка пока не найдена.\n\n"
+                "Нажмите «Подписаться на канал» выше, "
+                "подпишитесь и вернитесь — я проверю ещё раз.\n\n"
+                "В канале — разборы законов, кейсы и анонсы "
+                "новых гайдов. Полезно для бизнеса!"
             )
         await callback.answer(fail_text, show_alert=True)
         return
