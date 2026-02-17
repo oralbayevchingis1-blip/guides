@@ -28,7 +28,6 @@ from src.bot.handlers import (
     lead_form,
     legal_tools,
     live_support,
-    payments,
     questions,
     referral,
     start,
@@ -105,7 +104,6 @@ USER_COMMANDS = [
     BotCommand(command="booking", description="Запись на консультацию"),
     BotCommand(command="docgen", description="Генератор документов (.docx)"),
     BotCommand(command="mytasks", description="Мои задачи"),
-    BotCommand(command="shop", description="Премиум услуги"),
     BotCommand(command="referral", description="Реферальная программа"),
     BotCommand(command="lang", description="Выбор языка / Тіл / Language"),
     BotCommand(command="timezone", description="Часовой пояс"),
@@ -121,7 +119,6 @@ ADMIN_COMMANDS = [
     BotCommand(command="broadcast", description="Рассылка (#сегмент)"),
     BotCommand(command="reply", description="Ответить пользователю"),
     BotCommand(command="doc", description="Генератор документов"),
-    BotCommand(command="shop", description="Каталог услуг"),
     BotCommand(command="profile", description="Личный кабинет"),
     BotCommand(command="referral", description="Реферальная программа"),
     BotCommand(command="lang", description="Выбор языка"),
@@ -369,7 +366,6 @@ async def main() -> None:
     dp.include_router(consult.router)          # /consult
     dp.include_router(voice.router)            # голосовые сообщения → Whisper
     dp.include_router(strategy.router)         # /chat
-    dp.include_router(payments.router)         # /shop + Payments
     dp.include_router(cabinet.router)          # /profile, /karma
     dp.include_router(legal_tools.router)       # /review, /brainstorm, /bin, /tasks, /remind
     dp.include_router(corporate.router)        # /booking, /docgen, /mytasks, /invoice
