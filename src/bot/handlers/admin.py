@@ -390,25 +390,54 @@ async def cmd_sources(message: Message) -> None:
         return
 
     try:
-        stats = await get_traffic_source_stats()
-        if not stats:
-            await message.answer("📊 Данных по источникам пока нет.")
-            return
+        from src.database.crud import get_deeplink_stats, get_source_conversion_stats
 
-        total = sum(count for _, count in stats)
+        # ── 1. Источники трафика (из User.traffic_source) ──
+        stats = await get_traffic_source_stats()
         lines = ["📊 <b>Источники трафика</b>\n"]
 
-        for source, count in stats[:20]:
-            pct = count / total * 100
-            bar = "█" * max(1, round(pct / 5))
-            src_display = source if len(source) <= 35 else source[:32] + "…"
-            lines.append(f"<code>{src_display:35s}</code> {bar} {count} ({pct:.1f}%)")
+        if stats:
+            total = sum(count for _, count in stats)
+            for source, count in stats[:15]:
+                pct = count / total * 100
+                bar = "█" * max(1, round(pct / 5))
+                src_display = source if len(source) <= 30 else source[:27] + "…"
+                lines.append(f"<code>{src_display:30s}</code> {bar} {count} ({pct:.0f}%)")
+            lines.append(f"\n<b>Итого:</b> {total} пользователей")
+        else:
+            lines.append("<i>Пока нет данных</i>")
 
-        lines.append(f"\n<b>Итого:</b> {total} пользователей с меткой")
+        # ── 2. Deep link типы ──
+        dl_stats = await get_deeplink_stats()
+        if dl_stats:
+            lines.append("\n\n🔗 <b>Deep link типы</b>\n")
+            dl_labels = {
+                "deeplink_guide": "📚 Гайд",
+                "deeplink_article": "📰 Статья",
+                "deeplink_consult": "📞 Консультация",
+                "deeplink_referral": "👥 Реферал",
+            }
+            for step, count in dl_stats:
+                label = dl_labels.get(step, step)
+                lines.append(f"  {label}: <b>{count}</b>")
+
+        # ── 3. Конверсия по источникам ──
+        conv_stats = await get_source_conversion_stats()
+        if conv_stats:
+            lines.append("\n\n🔥 <b>Конверсия по каналам</b>")
+            lines.append("<i>(визиты → скачивания)</i>\n")
+            for source, starts, downloads in conv_stats[:10]:
+                cvr = (downloads / starts * 100) if starts > 0 else 0
+                src_short = source if len(source) <= 25 else source[:22] + "…"
+                lines.append(
+                    f"  <code>{src_short:25s}</code> "
+                    f"{starts}→{downloads} (<b>{cvr:.0f}%</b>)"
+                )
+
         lines.append(
-            "\n💡 <i>Формат deep link:</i>\n"
+            "\n\n💡 <i>Формат deep link:</i>\n"
             "<code>?start=guide_ID--src_SOURCE--med_MEDIUM--cmp_CAMPAIGN</code>\n"
-            "Или короткий: <code>?start=guide_ID--SOURCE</code>"
+            "Короткий: <code>?start=guide_ID--SOURCE</code>"
         )
 
         await message.answer("\n".join(lines))

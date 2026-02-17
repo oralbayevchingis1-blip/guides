@@ -123,6 +123,52 @@ async def get_traffic_source_stats() -> list[tuple[str, int]]:
         return [(row[0], row[1]) for row in result.all()]
 
 
+async def get_deeplink_stats() -> list[tuple[str, int]]:
+    """Статистика по типам deep link (deeplink_guide, deeplink_article, etc.)."""
+    async with async_session() as session:
+        stmt = (
+            select(
+                FunnelEvent.step,
+                sa_func.count().label("cnt"),
+            )
+            .where(FunnelEvent.step.like("deeplink_%"))
+            .group_by(FunnelEvent.step)
+            .order_by(sa_func.count().desc())
+        )
+        result = await session.execute(stmt)
+        return [(row[0], row[1]) for row in result.all()]
+
+
+async def get_source_conversion_stats() -> list[tuple[str, int, int]]:
+    """Источники с конверсией: (source, starts, pdf_delivered).
+
+    Позволяет анализировать, какие каналы приносят самых «горячих» лидов.
+    """
+    async with async_session() as session:
+        from sqlalchemy import case as sa_case
+
+        stmt = (
+            select(
+                FunnelEvent.source,
+                sa_func.count().label("starts"),
+                sa_func.sum(
+                    sa_case(
+                        (FunnelEvent.step == "pdf_delivered", 1),
+                        else_=0,
+                    )
+                ).label("downloads"),
+            )
+            .where(
+                FunnelEvent.source.isnot(None),
+                FunnelEvent.source != "",
+            )
+            .group_by(FunnelEvent.source)
+            .order_by(sa_func.count().desc())
+        )
+        result = await session.execute(stmt)
+        return [(row[0], row[1], row[2] or 0) for row in result.all()]
+
+
 async def update_user_activity(user_id: int) -> None:
     """Обновляет last_activity."""
     async with async_session() as session:

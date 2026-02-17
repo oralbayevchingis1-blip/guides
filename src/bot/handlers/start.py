@@ -98,6 +98,24 @@ def strip_utm(raw_args: str) -> str:
     return parts[0] if parts else raw_args
 
 
+def _utm_json(utm: UTMData) -> str | None:
+    """Сериализует UTM-данные в JSON-строку для поля meta (аналитика).
+
+    Возвращает None, если UTM-данных нет.
+    """
+    if not utm.source and not utm.medium and not utm.campaign:
+        return None
+    import json
+    d: dict[str, str] = {}
+    if utm.source:
+        d["src"] = utm.source
+    if utm.medium:
+        d["med"] = utm.medium
+    if utm.campaign:
+        d["cmp"] = utm.campaign
+    return json.dumps(d, ensure_ascii=False)
+
+
 def format_utm_source(utm: UTMData) -> str:
     """Форматирует UTM для хранения в поле traffic_source.
 
@@ -151,7 +169,7 @@ async def cmd_start(
     asyncio.create_task(track(
         user.id, "bot_start",
         source=source_str or None,
-        meta=clean_args[:100] if clean_args else None,
+        meta=_utm_json(utm) or (clean_args[:100] if clean_args else None),
     ))
 
     # ── Deep Link: гайд (guide_*) — показываем карточку сразу ────────
@@ -165,6 +183,13 @@ async def cmd_start(
         )
         await state.clear()
         await state.update_data(traffic_source=source_str)
+
+        asyncio.create_task(track(
+            user.id, "deeplink_guide",
+            guide_id=guide_slug,
+            source=source_str or None,
+            meta=_utm_json(utm),
+        ))
 
         catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
         matched_guide = None
@@ -219,6 +244,14 @@ async def cmd_start(
             user_id=user.id, username=user.username, full_name=user.full_name,
             traffic_source=source_str if source_str else None,
         )
+        await state.clear()
+        await state.update_data(traffic_source=source_str)
+
+        asyncio.create_task(track(
+            user.id, "deeplink_article",
+            source=source_str or None,
+            meta=_utm_json(utm) or article_slug[:100],
+        ))
 
         article = await google.get_article_by_id(article_slug)
         if article:
@@ -260,10 +293,58 @@ async def cmd_start(
             )
         return
 
+    # ── Deep Link: консультация (consult) ──────────────────────────
+    if clean_args == "consult":
+        logger.info("Consult deep link: user=%s, utm_src=%s", user.id, utm.source)
+
+        await get_or_create_user(
+            user_id=user.id, username=user.username, full_name=user.full_name,
+            traffic_source=source_str if source_str else None,
+        )
+        await state.clear()
+        await state.update_data(traffic_source=source_str)
+
+        asyncio.create_task(track(
+            user.id, "deeplink_consult",
+            source=source_str or None,
+            meta=_utm_json(utm),
+        ))
+
+        await message.answer("⚙️", reply_markup=main_menu_keyboard())
+        await message.answer(
+            "📞 <b>Бесплатная консультация</b>\n\n"
+            "Обсудим вашу ситуацию с практикующим юристом.\n"
+            "Нажмите кнопку ниже, чтобы записаться:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="📞 Записаться на консультацию",
+                    callback_data="book_consultation",
+                )],
+                [InlineKeyboardButton(
+                    text="📚 Посмотреть гайды",
+                    callback_data="show_categories",
+                )],
+            ]),
+        )
+        return
+
     # ── Deep Link: реферал (ref_{user_id}) ──────────────────────────
     if clean_args.startswith("ref_"):
         referrer_id = clean_args.removeprefix("ref_")
-        logger.info("Referral deep link: user=%s, referrer=%s", user.id, referrer_id)
+        logger.info("Referral deep link: user=%s, referrer=%s, utm_src=%s", user.id, referrer_id, utm.source)
+
+        await get_or_create_user(
+            user_id=user.id, username=user.username, full_name=user.full_name,
+            traffic_source=source_str or f"ref_{referrer_id}",
+        )
+        await state.clear()
+        await state.update_data(traffic_source=source_str or f"ref_{referrer_id}")
+
+        asyncio.create_task(track(
+            user.id, "deeplink_referral",
+            source=source_str or f"ref_{referrer_id}",
+            meta=_utm_json(utm),
+        ))
 
     # ── Стандартный /start flow ───────────────────────────────────────
     # Value-first: сразу показываем категории гайдов.
