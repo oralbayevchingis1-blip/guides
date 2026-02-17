@@ -567,6 +567,7 @@ async def process_guide_download(
                 email=existing_lead.email,
                 guide=guide_id,
                 source=traffic_source,
+                sphere=getattr(existing_lead, "business_sphere", "") or "",
             )
         )
 
@@ -595,15 +596,28 @@ async def process_guide_download(
         sphere = getattr(existing_lead, "business_sphere", None) or ""
         name = existing_lead.name
 
-        # Подбираем следующий гайд (умная рекомендация → Sheets → сфера → любой)
+        # Подбираем следующий гайд (collab → сфера → Sheets → любой)
         downloaded_set = await _get_downloaded_set(user_id)
         exclude = downloaded_set | {guide_id}
+        rec_source = ""
 
         # 1. Коллаборативная фильтрация: «часто скачивают вместе»
         next_gid = await smart_recommender.get_recommendation(guide_id, exclude=exclude)
         next_guide = _find_guide(catalog, next_gid) if next_gid else None
+        if next_guide:
+            rec_source = "collab"
 
-        # 2. Статический маппинг из листа «Рекомендации»
+        # 2. По сфере бизнеса (приоритет выше статического маппинга)
+        if not next_guide and has_sphere:
+            next_guide = _find_guide_by_sphere(
+                catalog, existing_lead.business_sphere, exclude_ids=exclude,
+                downloaded=downloaded_set,
+            )
+            if next_guide:
+                next_gid = next_guide.get("id", "")
+                rec_source = "sphere"
+
+        # 3. Статический маппинг из листа «Рекомендации»
         recommendations = await cache.get_or_fetch("recommendations", google.get_recommendations)
         rec = recommendations.get(guide_id, {})
         next_article = rec.get("next_article_link", "")
@@ -612,15 +626,7 @@ async def process_guide_download(
             next_guide = _find_guide(catalog, sheet_gid) if sheet_gid else None
             if next_guide:
                 next_gid = sheet_gid
-
-        # 3. По сфере бизнеса
-        if not next_guide and has_sphere:
-            next_guide = _find_guide_by_sphere(
-                catalog, existing_lead.business_sphere, exclude_ids=exclude,
-                downloaded=downloaded_set,
-            )
-            if next_guide:
-                next_gid = next_guide.get("id", "")
+                rec_source = "sheets"
 
         # 4. Любой не скачанный
         if not next_guide:
@@ -629,6 +635,7 @@ async def process_guide_download(
                 if gid and gid not in exclude:
                     next_guide = g
                     next_gid = gid
+                    rec_source = "fallback"
                     break
 
         # Формируем текст
@@ -638,12 +645,20 @@ async def process_guide_download(
 
         if next_guide:
             next_title = next_guide.get("title", next_gid)
-            sphere_hint = ""
-            if has_sphere:
-                sphere_hint = f" (для сферы «{_esc_html(sphere)}»)"
-            parts.append(
-                f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}»{sphere_hint}"
-            )
+            if rec_source == "sphere" and sphere:
+                parts.append(
+                    f"\n📚 <b>Для {_esc_html(sphere)}-бизнеса рекомендуем:</b> "
+                    f"«{_esc_html(next_title)}»"
+                )
+            elif has_sphere and sphere:
+                parts.append(
+                    f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}» "
+                    f"(для сферы «{_esc_html(sphere)}»)"
+                )
+            else:
+                parts.append(
+                    f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}»"
+                )
 
         # Scarcity консультаций
         scarcity = await _get_consult_scarcity_line()
@@ -848,6 +863,18 @@ async def process_profile_button(
     await callback.answer()
 
     if value == "skip":
+        # Проверяем, обязательное ли поле
+        from src.bot.utils.profiling import PROFILE_QUESTIONS
+        is_required = any(
+            q.field == field and q.required for q in PROFILE_QUESTIONS
+        )
+        if is_required:
+            await callback.message.answer(
+                "Пожалуйста, выберите сферу — это поможет нам "
+                "подобрать наиболее полезные материалы для вас.",
+            )
+            return
+
         await callback.message.edit_text(
             "Хорошо, пропускаем. Вы всегда сможете уточнить позже.",
         )
@@ -1042,7 +1069,7 @@ async def process_consent(
     )
     metrics.inc("leads_saved")
 
-    # 2. Google Sheets
+    # 2. Google Sheets (sphere пока пустая — заполнится через profiling)
     asyncio.create_task(
         google.append_lead(
             user_id=user_id,

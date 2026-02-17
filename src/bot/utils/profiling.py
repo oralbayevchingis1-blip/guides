@@ -25,6 +25,7 @@ class ProfileQuestion:
     prompt: str              # текст вопроса для пользователя
     options: list[tuple[str, str]]  # [(label, value), ...]
     skip_label: str = "⏭ Пропустить"
+    required: bool = False   # если True — кнопка «Пропустить» не показывается
 
 
 PROFILE_QUESTIONS: list[ProfileQuestion] = [
@@ -45,6 +46,7 @@ PROFILE_QUESTIONS: list[ProfileQuestion] = [
             ("🏥 Медицина", "Медицина"),
             ("📊 Консалтинг", "Консалтинг"),
         ],
+        required=True,
     ),
     ProfileQuestion(
         field="company_size",
@@ -118,10 +120,11 @@ def build_question_keyboard(question: ProfileQuestion) -> InlineKeyboardMarkup:
             ))
         rows.append(row)
 
-    rows.append([InlineKeyboardButton(
-        text=question.skip_label,
-        callback_data=f"profile_{question.field}_skip",
-    )])
+    if not question.required:
+        rows.append([InlineKeyboardButton(
+            text=question.skip_label,
+            callback_data=f"profile_{question.field}_skip",
+        )])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

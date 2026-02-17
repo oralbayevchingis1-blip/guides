@@ -148,7 +148,8 @@ SHEET_SCHEMAS: dict[str, dict[str, list[str]]] = {
         # interests/warmth не обновятся, но запись лида не сломается.
         "required": [],
         "optional": ["user_id", "email", "guide", "timestamp", "username",
-                      "name", "consent", "source", "interests", "warmth"],
+                      "name", "consent", "source", "interests", "warmth",
+                      "sphere_tag"],
     },
     SHEET_FOLLOWUP: {
         "required": ["key", "text"],
@@ -427,12 +428,13 @@ class GoogleSheetsClient:
             logger.error("Ошибка записи лида в Sheets: %s", e)
 
     @retry_sheets()
-    def _sync_update_lead_interests(self, user_id: int, guide: str) -> None:
-        """Обновляет колонки 'Интересы' и 'Warmth' для существующего лида.
+    def _sync_update_lead_interests(self, user_id: int, guide: str, sphere: str = "") -> None:
+        """Обновляет колонки 'Интересы', 'Warmth' и 'sphere_tag' для лида.
 
         Ищет строки с данным user_id и дополняет их:
         - Интересы: список скачанных гайдов через запятую.
         - Warmth: Cold -> Warm (после скачивания гайда), Hot (после 3+ гайдов).
+        - sphere_tag: сфера бизнеса (если известна).
         """
         try:
             ws = self._get_spreadsheet().worksheet(SHEET_LEADS)
@@ -461,35 +463,48 @@ class GoogleSheetsClient:
 
             interests = ", ".join(sorted(user_guides))
 
-            # Проверяем, есть ли колонки «interests» и «warmth» в заголовке
+            # Проверяем, есть ли нужные колонки в заголовке
             header = ws.row_values(1)
             interests_col = None
             warmth_col = None
+            sphere_col = None
+            next_new_col = len(header) + 1
             for i, h in enumerate(header, start=1):
-                if h.lower() == "interests":
+                hl = h.lower().strip()
+                if hl == "interests":
                     interests_col = i
-                elif h.lower() == "warmth":
+                elif hl == "warmth":
                     warmth_col = i
+                elif hl in ("sphere_tag", "sphere", "сфера"):
+                    sphere_col = i
 
             # Если колонок нет — добавляем
             if interests_col is None:
-                interests_col = len(header) + 1
+                interests_col = next_new_col
                 ws.update_cell(1, interests_col, "interests")
+                next_new_col += 1
             if warmth_col is None:
-                warmth_col = len(header) + 2 if interests_col == len(header) + 1 else len(header) + 1
+                warmth_col = next_new_col
                 ws.update_cell(1, warmth_col, "warmth")
+                next_new_col += 1
+            if sphere_col is None:
+                sphere_col = next_new_col
+                ws.update_cell(1, sphere_col, "sphere_tag")
+                next_new_col += 1
 
             # Обновляем все строки пользователя
             for row_idx in user_row_indices:
                 ws.update_cell(row_idx, interests_col, interests)
                 ws.update_cell(row_idx, warmth_col, warmth)
+                if sphere:
+                    ws.update_cell(row_idx, sphere_col, sphere)
 
             logger.info(
-                "CRM обновлен: user_id=%s, interests=%s, warmth=%s",
-                user_id, interests, warmth,
+                "CRM обновлен: user_id=%s, interests=%s, warmth=%s, sphere=%s",
+                user_id, interests, warmth, sphere or "-",
             )
         except Exception as e:
-            logger.error("Ошибка обновления interests/warmth: %s", e)
+            logger.error("Ошибка обновления interests/warmth/sphere: %s", e)
 
     async def append_lead(
         self,
@@ -501,6 +516,7 @@ class GoogleSheetsClient:
         guide: str,
         consent: bool = True,
         source: str = "",
+        sphere: str = "",
     ) -> None:
         """Добавляет строку лида в лист «Лиды».
 
@@ -512,6 +528,7 @@ class GoogleSheetsClient:
             guide: ID выбранного гайда.
             consent: Дано ли согласие.
             source: Источник трафика (deep-link).
+            sphere: Сфера бизнеса (если известна).
         """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         row = [
@@ -523,12 +540,13 @@ class GoogleSheetsClient:
             guide,
             "Да" if consent else "Нет",
             source,
+            sphere,
         ]
         await asyncio.to_thread(self._sync_append_lead, row)
 
-        # Обновляем interests/warmth для CRM-интеграции между ботами
+        # Обновляем interests/warmth/sphere для CRM-интеграции
         asyncio.create_task(
-            asyncio.to_thread(self._sync_update_lead_interests, user_id, guide)
+            asyncio.to_thread(self._sync_update_lead_interests, user_id, guide, sphere)
         )
 
         # Обновляем аналитику после каждого лида

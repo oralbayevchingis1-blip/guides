@@ -73,20 +73,26 @@ async def _ask_phone(message: Message, state: FSMContext, user_id: int) -> None:
 
     await state.clear()
 
-    # Если сфера бизнеса не указана — спрашиваем сначала
+    # Если сфера бизнеса не указана — обязательно спрашиваем
     if lead and not getattr(lead, "business_sphere", None):
+        from src.bot.utils.profiling import PROFILE_QUESTIONS, build_question_keyboard
+        sphere_q = next((q for q in PROFILE_QUESTIONS if q.field == "business_sphere"), None)
+        if sphere_q:
+            kb = build_question_keyboard(sphere_q)
+            kb.inline_keyboard.append(
+                [InlineKeyboardButton(text="Отмена", callback_data="cancel_consultation")]
+            )
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Отмена", callback_data="cancel_consultation")],
+            ])
         await state.set_state(ConsultForm.waiting_for_sphere)
+        await state.update_data(return_to="consultation")
         await message.answer(
             f"{lead.name}, перед записью — подскажите, "
             "<b>в какой сфере ваш бизнес?</b>\n\n"
-            "Это поможет юристу подготовиться к разговору.\n\n"
-            "<i>Например: IT, строительство, ритейл, инвестиции</i>",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="⏭ Пропустить", callback_data="consult_skip_sphere")],
-                    [InlineKeyboardButton(text="Отмена", callback_data="cancel_consultation")],
-                ]
-            ),
+            "Это поможет юристу подготовиться к разговору.",
+            reply_markup=kb,
         )
         return
 
@@ -131,11 +137,44 @@ async def _ask_phone(message: Message, state: FSMContext, user_id: int) -> None:
 
 @router.callback_query(F.data == "consult_skip_sphere", ConsultForm.waiting_for_sphere)
 async def skip_sphere_consult(callback: CallbackQuery, state: FSMContext) -> None:
-    """Пропуск вопроса о сфере."""
+    """Сфера обязательна — мягко просим выбрать."""
     await callback.answer()
+    await callback.message.answer(
+        "Пожалуйста, выберите сферу — это поможет юристу "
+        "подготовиться к разговору.",
+    )
+
+
+@router.callback_query(
+    F.data.startswith("profile_business_sphere_"),
+    ConsultForm.waiting_for_sphere,
+)
+async def process_sphere_button_consult(
+    callback: CallbackQuery,
+    state: FSMContext,
+    google: GoogleSheetsClient,
+) -> None:
+    """Обработка выбора сферы через inline-кнопку перед консультацией."""
+    value = callback.data.removeprefix("profile_business_sphere_")
+    await callback.answer()
+
+    if value == "skip":
+        await callback.message.answer(
+            "Пожалуйста, выберите сферу — это поможет юристу "
+            "подготовиться к разговору.",
+        )
+        return
+
+    user_id = callback.from_user.id
+    await update_lead_sphere(user_id, value)
+    asyncio.create_task(google.update_lead_sphere(user_id, value))
+    from src.database.crud import update_user_profile
+    await update_user_profile(user_id, business_sphere=value)
+    logger.info("Sphere (consult button): user=%s sphere='%s'", user_id, value)
+
     await state.set_state(ConsultForm.waiting_for_phone)
     await callback.message.edit_text(
-        "📞 Укажите ваш номер телефона для записи на консультацию:",
+        f"👍 Отлично, {value}! Теперь укажите ваш номер телефона:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="Отмена", callback_data="cancel_consultation")],
@@ -161,8 +200,9 @@ async def process_sphere_consult(
         user_id = message.from_user.id
         sphere = text[:100]
         await update_lead_sphere(user_id, sphere)
-        import asyncio
         asyncio.create_task(google.update_lead_sphere(user_id, sphere))
+        from src.database.crud import update_user_profile
+        await update_user_profile(user_id, business_sphere=sphere)
         logger.info("Sphere (consult): user=%s sphere='%s'", user_id, sphere[:50])
 
     await state.set_state(ConsultForm.waiting_for_phone)
