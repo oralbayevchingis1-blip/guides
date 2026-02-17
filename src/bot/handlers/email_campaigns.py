@@ -101,7 +101,7 @@ def _build_audience(
     """Строит сегментированную аудиторию.
 
     Returns:
-        Список уникальных записей: {user_id, email, name, interests, warmth, guides}
+        Список уникальных записей: {user_id, email, name, interests, warmth, guides, sphere}
     """
     target_set = {t.lower() for t in target_tags} if target_tags else None
 
@@ -118,6 +118,7 @@ def _build_audience(
         email = str(lead.get("email", "")).strip().lower()
         name = str(lead.get("name", "")).strip()
         warmth = str(lead.get("warmth", "Cold")).strip()
+        sphere = str(lead.get("sphere_tag", "")).strip()
 
         if uid not in user_data:
             user_data[uid] = {
@@ -125,11 +126,14 @@ def _build_audience(
                 "email": email,
                 "name": name,
                 "warmth": warmth,
+                "sphere": sphere,
                 "guides": set(),
                 "interests": set(),
             }
         elif email and not user_data[uid]["email"]:
             user_data[uid]["email"] = email
+        if sphere and not user_data[uid].get("sphere"):
+            user_data[uid]["sphere"] = sphere
 
         guide = str(lead.get("guide", lead.get("selected_guide", ""))).strip()
         if guide:
@@ -155,6 +159,7 @@ def _build_audience(
             "email": email,
             "name": ud["name"],
             "warmth": ud["warmth"],
+            "sphere": ud.get("sphere", ""),
             "guides": ud["guides"],
             "interests": ud["interests"],
         })
@@ -162,9 +167,69 @@ def _build_audience(
     return audience
 
 
+def _pick_best_guide_for_user(
+    user: dict,
+    catalog: list[dict],
+) -> dict | None:
+    """Подбирает лучший гайд для пользователя на основе его интересов.
+
+    Логика: находим гайд из тех же тематических тегов, который
+    пользователь ещё НЕ скачивал. Приоритет — максимум совпадений.
+    """
+    downloaded = user.get("guides", set())
+    user_interests = user.get("interests", set())
+
+    if not user_interests:
+        # Нет интересов — берём любой не скачанный
+        for g in catalog:
+            gid = str(g.get("id", ""))
+            if gid and gid not in downloaded:
+                return g
+        return None
+
+    # Считаем score для каждого гайда
+    scored: list[tuple[int, dict]] = []
+    for g in catalog:
+        gid = str(g.get("id", ""))
+        if not gid or gid in downloaded:
+            continue
+
+        guide_tags: set[str] = set()
+        for key, tags in GUIDE_INTEREST_MAP.items():
+            if key in gid.lower():
+                guide_tags.update(tags)
+
+        overlap = len(user_interests & guide_tags)
+        if overlap > 0:
+            scored.append((overlap, g))
+
+    if scored:
+        scored.sort(key=lambda x: -x[0])
+        return scored[0][1]
+
+    # Fallback: любой не скачанный
+    for g in catalog:
+        gid = str(g.get("id", ""))
+        if gid and gid not in downloaded:
+            return g
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Email-шаблон для ретаргетинга
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+# ── Крючки по сфере для email ──────────────────────────────────────────────
+
+_SPHERE_EMAIL_HOOKS: dict[str, str] = {
+    "it": "Мы видим, что IT-компаниям сейчас особенно важно разбираться в этой теме.",
+    "производство": "Для производственных компаний это особенно актуально в 2025 году.",
+    "ритейл": "В ритейле эти вопросы стоят особенно остро — и вот почему.",
+    "инвестиции": "Если вы инвестор или работаете с инвесторами — это must-read.",
+    "финтех": "Для финтех-проектов важно учитывать нюансы, описанные в гайде.",
+    "стартап": "Стартапам критически важно разобраться в этом до привлечения инвестиций.",
+}
 
 
 def build_retarget_email(
@@ -173,8 +238,12 @@ def build_retarget_email(
     bot_username: str,
     *,
     campaign_id: str = "",
+    sphere: str = "",
 ) -> tuple[str, str]:
     """Генерирует HTML-письмо с рекомендацией гайда.
+
+    Args:
+        sphere: Сфера бизнеса пользователя (для персонализации).
 
     Returns:
         (subject, html_body)
@@ -185,8 +254,9 @@ def build_retarget_email(
     preview = guide.get("preview_text", "") or guide.get("preview", "")
     highlights = guide.get("highlights", "")
     pages = str(guide.get("pages", "")).strip()
+    download_count = guide.get("download_count", "")
 
-    utm = f"--src_email--cmp_{campaign_id}" if campaign_id else "--email"
+    utm = f"--src_email--cmp_{campaign_id}" if campaign_id else "--src_email"
     deep_link = f"https://t.me/{bot_username}?start=guide_{guide_id}{utm}"
 
     # Highlights → bullets
@@ -205,6 +275,27 @@ def build_retarget_email(
     meta_parts.extend(["PDF", "бесплатно"])
     meta_line = " · ".join(meta_parts)
 
+    # Social proof
+    social_proof = ""
+    if download_count:
+        social_proof = (
+            f'<p style="margin:8px 0 16px;color:#16a34a;font-size:13px;">'
+            f"📊 Уже <b>{_esc(str(download_count))}</b> предпринимателей скачали этот гайд"
+            f"</p>"
+        )
+
+    # Персонализация по сфере
+    sphere_hook = ""
+    if sphere:
+        sphere_lower = sphere.lower()
+        for key, hook_text in _SPHERE_EMAIL_HOOKS.items():
+            if key in sphere_lower:
+                sphere_hook = (
+                    f'<p style="color:#555;margin:0 0 12px;">'
+                    f"💡 <i>{_esc(hook_text)}</i></p>"
+                )
+                break
+
     subject = f"{name}, новый гайд для вас: «{guide_title}»"
 
     html_body = f"""
@@ -220,6 +311,8 @@ def build_retarget_email(
             <p style="color:#555;">На основе ваших интересов мы подобрали новый материал,
             который может быть полезен для вашего бизнеса:</p>
 
+            {sphere_hook}
+
             <div style="background:#f8f9fa;border-left:4px solid #2563eb;padding:20px;
                         margin:20px 0;border-radius:8px;">
                 <h2 style="margin:0 0 8px;font-size:18px;color:#1a237e;">
@@ -227,6 +320,7 @@ def build_retarget_email(
                 {'<p style="margin:0 0 12px;color:#555;">' + _esc(guide_desc) + '</p>' if guide_desc else ''}
                 {bullets_html}
                 {'<p style="margin:0 0 12px;color:#555;"><b>Что внутри:</b> ' + _esc(preview) + '</p>' if preview and not bullets_html else ''}
+                {social_proof}
                 <p style="margin:0 0 16px;font-size:13px;color:#888;">📎 {meta_line}</p>
                 <a href="{_esc(deep_link)}"
                    style="display:inline-block;background:#2563eb;color:#fff;
@@ -385,7 +479,19 @@ async def campaign_segment_chosen(
 
     # Показываем гайды для рекомендации
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
-    buttons = []
+
+    # Считаем, скольким подойдёт авто-рекомендация
+    auto_count = sum(
+        1 for u in audience if _pick_best_guide_for_user(u, catalog)
+    )
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"🤖 Авто — каждому свой ({auto_count} чел.)",
+            callback_data="ecamp_guide_AUTO",
+        )],
+    ]
+
     for g in catalog:
         gid = g.get("id", "")
         title = g.get("title", gid)[:35]
@@ -398,7 +504,9 @@ async def campaign_segment_chosen(
 
     await callback.message.edit_text(
         f"📧 <b>Сегмент:</b> {seg_label} ({len(audience)} чел.)\n\n"
-        "📚 <b>Какой гайд рекомендовать в письме?</b>",
+        "📚 <b>Какой гайд рекомендовать в письме?</b>\n\n"
+        "<i>🤖 Авто = каждый получит персональный гайд "
+        "на основе своих скачиваний.</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await state.set_state(CampaignStates.choose_guide)
@@ -418,63 +526,116 @@ async def campaign_guide_chosen(
     await callback.answer()
 
     guide_id = callback.data.removeprefix("ecamp_guide_")
+    is_auto = guide_id == "AUTO"
+
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
-
-    guide = None
-    for g in catalog:
-        if str(g.get("id", "")) == guide_id:
-            guide = g
-            break
-
-    if not guide:
-        await callback.message.edit_text("❌ Гайд не найден.")
-        await state.clear()
-        return
 
     data = await state.get_data()
     seg_label = data.get("campaign_seg_label", "?")
     audience_count = data.get("campaign_audience_count", 0)
 
     # Генерируем campaign_id
-    campaign_id = f"retarget_{guide_id}_{datetime.now(timezone.utc).strftime('%d%m')}"
+    ts = datetime.now(timezone.utc).strftime("%d%m")
+    campaign_id = f"retarget_auto_{ts}" if is_auto else f"retarget_{guide_id}_{ts}"
 
     await state.update_data(
         campaign_guide_id=guide_id,
         campaign_id=campaign_id,
+        campaign_auto=is_auto,
     )
 
     bot_info = await bot.get_me()
 
-    # Превью письма
-    subject, _ = build_retarget_email(
-        name="Айдар",
-        guide=guide,
-        bot_username=bot_info.username,
-        campaign_id=campaign_id,
-    )
+    if is_auto:
+        # Показываем распределение рекомендаций
+        leads = await google.get_recent_leads(limit=5000)
+        segment = data.get("campaign_segment", "all")
+        if segment == "all":
+            audience = _build_audience(leads)
+        elif segment == "hot":
+            audience = _build_audience(leads, warmth_filter="Hot")
+        else:
+            audience = _build_audience(leads, target_tags=[segment])
 
-    guide_title = guide.get("title", guide_id)
+        guide_dist: dict[str, int] = {}
+        no_guide = 0
+        for u in audience:
+            best = _pick_best_guide_for_user(u, catalog)
+            if best:
+                title = best.get("title", best.get("id", "?"))[:25]
+                guide_dist[title] = guide_dist.get(title, 0) + 1
+            else:
+                no_guide += 1
 
-    await callback.message.edit_text(
-        f"📧 <b>Превью email-кампании</b>\n\n"
-        f"🎯 Сегмент: <b>{seg_label}</b>\n"
-        f"👥 Получателей: <b>{audience_count}</b>\n"
-        f"📚 Гайд: <b>{_esc(guide_title)}</b>\n"
-        f"📝 Тема: <i>{_esc(subject)}</i>\n"
-        f"🆔 Campaign: <code>{campaign_id}</code>\n\n"
-        f"UTM в ссылке: <code>src_email, cmp_{campaign_id}</code>\n\n"
-        "Отправить?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Отправить", callback_data="ecamp_send"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="ecamp_cancel"),
-            ],
-            [InlineKeyboardButton(
-                text="👁 Тестовое письмо (себе)",
-                callback_data="ecamp_test",
-            )],
-        ]),
-    )
+        dist_lines = []
+        for title, cnt in sorted(guide_dist.items(), key=lambda x: -x[1])[:8]:
+            dist_lines.append(f"  📚 {_esc(title)} → <b>{cnt}</b> чел.")
+
+        await callback.message.edit_text(
+            f"📧 <b>Авто-рекомендация</b>\n\n"
+            f"🎯 Сегмент: <b>{seg_label}</b>\n"
+            f"👥 Получателей: <b>{audience_count}</b>\n"
+            f"🤖 Режим: <b>персональный гайд для каждого</b>\n"
+            f"🆔 Campaign: <code>{campaign_id}</code>\n\n"
+            f"📊 <b>Распределение:</b>\n"
+            + "\n".join(dist_lines)
+            + (f"\n  ⏭ Без рекомендации (всё скачали): {no_guide}" if no_guide else "")
+            + f"\n\nUTM: <code>src_email / cmp_{campaign_id}</code>\n\n"
+            "Отправить?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Отправить", callback_data="ecamp_send"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="ecamp_cancel"),
+                ],
+                [InlineKeyboardButton(
+                    text="👁 Тестовое письмо (себе)",
+                    callback_data="ecamp_test",
+                )],
+            ]),
+        )
+    else:
+        guide = None
+        for g in catalog:
+            if str(g.get("id", "")) == guide_id:
+                guide = g
+                break
+
+        if not guide:
+            await callback.message.edit_text("❌ Гайд не найден.")
+            await state.clear()
+            return
+
+        # Превью письма
+        subject, _ = build_retarget_email(
+            name="Айдар",
+            guide=guide,
+            bot_username=bot_info.username,
+            campaign_id=campaign_id,
+        )
+
+        guide_title = guide.get("title", guide_id)
+
+        await callback.message.edit_text(
+            f"📧 <b>Превью email-кампании</b>\n\n"
+            f"🎯 Сегмент: <b>{seg_label}</b>\n"
+            f"👥 Получателей: <b>{audience_count}</b>\n"
+            f"📚 Гайд: <b>{_esc(guide_title)}</b>\n"
+            f"📝 Тема: <i>{_esc(subject)}</i>\n"
+            f"🆔 Campaign: <code>{campaign_id}</code>\n\n"
+            f"UTM в ссылке: <code>src_email, cmp_{campaign_id}</code>\n\n"
+            "Отправить?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Отправить", callback_data="ecamp_send"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="ecamp_cancel"),
+                ],
+                [InlineKeyboardButton(
+                    text="👁 Тестовое письмо (себе)",
+                    callback_data="ecamp_test",
+                )],
+            ]),
+        )
+
     await state.set_state(CampaignStates.confirm)
 
 
@@ -494,12 +655,9 @@ async def campaign_test_email(
     data = await state.get_data()
     guide_id = data.get("campaign_guide_id", "")
     campaign_id = data.get("campaign_id", "")
+    is_auto = data.get("campaign_auto", False)
 
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
-    guide = next((g for g in catalog if str(g.get("id", "")) == guide_id), None)
-    if not guide:
-        await callback.message.answer("❌ Гайд не найден.")
-        return
 
     bot_info = await bot.get_me()
 
@@ -513,6 +671,24 @@ async def campaign_test_email(
         )
         return
 
+    if is_auto:
+        # Для авто-режима подбираем лучший гайд для админа
+        leads = await google.get_recent_leads(limit=5000)
+        admin_audience = _build_audience(leads)
+        admin_user = next(
+            (u for u in admin_audience if u["user_id"] == settings.ADMIN_ID),
+            {"guides": set(), "interests": set()},
+        )
+        guide = _pick_best_guide_for_user(admin_user, catalog)
+        if not guide:
+            guide = catalog[0] if catalog else None
+    else:
+        guide = next((g for g in catalog if str(g.get("id", "")) == guide_id), None)
+
+    if not guide:
+        await callback.message.answer("❌ Гайд не найден.")
+        return
+
     subject, html_body = build_retarget_email(
         name=admin_lead.name or "Admin",
         guide=guide,
@@ -523,9 +699,12 @@ async def campaign_test_email(
     from src.bot.utils.email_sender import send_email
     ok = await send_email(admin_lead.email, f"[TEST] {subject}", html_body)
 
+    guide_title = guide.get("title", "?")
     if ok:
         await callback.message.answer(
-            f"✅ Тестовое письмо отправлено на <code>{admin_lead.email}</code>"
+            f"✅ Тестовое письмо отправлено на <code>{admin_lead.email}</code>\n"
+            f"📚 Гайд в письме: <b>{_esc(guide_title)}</b>"
+            + (" (авто-подбор)" if is_auto else "")
         )
     else:
         await callback.message.answer("❌ Ошибка отправки. Проверьте логи.")
@@ -548,13 +727,20 @@ async def campaign_send(
     segment = data.get("campaign_segment", "all")
     guide_id = data.get("campaign_guide_id", "")
     campaign_id = data.get("campaign_id", "")
+    is_auto = data.get("campaign_auto", False)
     await state.clear()
 
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
-    guide = next((g for g in catalog if str(g.get("id", "")) == guide_id), None)
-    if not guide:
-        await callback.message.edit_text("❌ Гайд не найден.")
-        return
+
+    if not is_auto:
+        guide_fixed = next(
+            (g for g in catalog if str(g.get("id", "")) == guide_id), None,
+        )
+        if not guide_fixed:
+            await callback.message.edit_text("❌ Гайд не найден.")
+            return
+    else:
+        guide_fixed = None
 
     # Строим аудиторию
     leads = await google.get_recent_leads(limit=5000)
@@ -573,6 +759,7 @@ async def campaign_send(
     total = len(audience)
     sent = 0
     failed = 0
+    skipped = 0
 
     status_msg = await callback.message.edit_text(
         f"⏳ Email-кампания запущена: 0/{total}..."
@@ -584,16 +771,23 @@ async def campaign_send(
         email = user["email"]
         name = user.get("name") or "Коллега"
 
-        # Пропускаем, если пользователь уже скачал этот гайд
-        if guide_id in user.get("guides", set()):
-            total -= 1
-            continue
+        if is_auto:
+            guide = _pick_best_guide_for_user(user, catalog)
+            if not guide:
+                skipped += 1
+                continue
+        else:
+            guide = guide_fixed
+            if guide_id in user.get("guides", set()):
+                skipped += 1
+                continue
 
         subject, html_body = build_retarget_email(
             name=name,
             guide=guide,
             bot_username=bot_info.username,
             campaign_id=campaign_id,
+            sphere=user.get("sphere", ""),
         )
 
         try:
@@ -606,12 +800,13 @@ async def campaign_send(
             failed += 1
             logger.warning("Email campaign send failed for %s: %s", email[:20], e)
 
-        # Прогресс
+        # Прогресс каждые 5 писем
         if i % 5 == 0 or i == len(audience):
             try:
                 await status_msg.edit_text(
                     f"⏳ Email-кампания: {i}/{total}\n"
                     f"✅ Отправлено: {sent}\n"
+                    f"⏭ Пропущено: {skipped}\n"
                     f"❌ Ошибок: {failed}"
                 )
             except Exception:
@@ -621,12 +816,14 @@ async def campaign_send(
         await asyncio.sleep(0.15)
 
     # Лог кампании
+    mode = "auto" if is_auto else guide_id
     campaign_log = {
         "campaign_id": campaign_id,
         "segment": segment,
-        "guide_id": guide_id,
+        "mode": mode,
         "total": total,
         "sent": sent,
+        "skipped": skipped,
         "failed": failed,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -637,7 +834,7 @@ async def campaign_send(
         await google.log_email_campaign(
             campaign_id=campaign_id,
             segment=segment,
-            guide_id=guide_id,
+            guide_id=mode,
             total=total,
             sent=sent,
             failed=failed,
@@ -648,8 +845,10 @@ async def campaign_send(
     await status_msg.edit_text(
         f"✅ <b>Email-кампания завершена!</b>\n\n"
         f"🆔 {campaign_id}\n"
+        f"🤖 Режим: <b>{'авто-подбор' if is_auto else guide_id}</b>\n"
         f"📊 Всего: {total}\n"
         f"✅ Отправлено: {sent}\n"
+        f"⏭ Пропущено: {skipped}\n"
         f"❌ Ошибок: {failed}\n\n"
         f"UTM: <code>src_email / cmp_{campaign_id}</code>\n"
         "Отслеживайте переходы через /sources"
@@ -665,4 +864,98 @@ async def campaign_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-    # /export_audience находится в admin.py
+# ═══════════════════════════════════════════════════════════════════════════
+#  Автоматическая рассылка — еженедельный дайджест новых гайдов
+# ═══════════════════════════════════════════════════════════════════════════
+
+_last_known_guide_ids: set[str] = set()
+
+
+async def auto_email_retarget(
+    *,
+    bot: Bot,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Автоматическая email-рассылка: каждому — персональный гайд.
+
+    Запускается по расписанию (еженедельно). Отправляет
+    персонализированные рекомендации тем пользователям, которые
+    давно не скачивали гайды или есть не скачанные новинки.
+    """
+    from src.bot.utils.email_sender import is_email_configured, send_email
+
+    if not is_email_configured():
+        logger.info("Auto email retarget skipped — email not configured")
+        return
+
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    leads = await google.get_recent_leads(limit=5000)
+    audience = _build_audience(leads)
+
+    if not audience:
+        logger.info("Auto email retarget: no audience with emails")
+        return
+
+    bot_info = await bot.get_me()
+    ts = datetime.now(timezone.utc).strftime("%d%m")
+    campaign_id = f"auto_weekly_{ts}"
+
+    sent = 0
+    skipped = 0
+
+    for user in audience:
+        guide = _pick_best_guide_for_user(user, catalog)
+        if not guide:
+            skipped += 1
+            continue
+
+        name = user.get("name") or "Коллега"
+        subject, html_body = build_retarget_email(
+            name=name,
+            guide=guide,
+            bot_username=bot_info.username,
+            campaign_id=campaign_id,
+            sphere=user.get("sphere", ""),
+        )
+
+        try:
+            ok = await send_email(user["email"], subject, html_body)
+            if ok:
+                sent += 1
+        except Exception as e:
+            logger.warning("Auto retarget failed for %s: %s", user["email"][:20], e)
+
+        await asyncio.sleep(0.15)
+
+    logger.info(
+        "Auto email retarget done: campaign=%s sent=%d skipped=%d",
+        campaign_id, sent, skipped,
+    )
+
+    # Уведомляем админа
+    if sent > 0:
+        try:
+            await bot.send_message(
+                settings.ADMIN_ID,
+                f"📧 <b>Авто-рассылка завершена</b>\n\n"
+                f"🆔 {campaign_id}\n"
+                f"✅ Отправлено: {sent}\n"
+                f"⏭ Пропущено (всё скачали): {skipped}\n\n"
+                f"UTM: <code>src_email / cmp_{campaign_id}</code>",
+            )
+        except Exception:
+            pass
+
+    # Логируем в Sheets
+    try:
+        await google.log_email_campaign(
+            campaign_id=campaign_id,
+            segment="auto_all",
+            guide_id="auto_personalized",
+            total=len(audience),
+            sent=sent,
+            failed=skipped,
+        )
+    except Exception as e:
+        logger.warning("Failed to log auto campaign to Sheets: %s", e)

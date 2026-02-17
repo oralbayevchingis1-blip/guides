@@ -89,6 +89,11 @@ async def _job_qa_audit() -> None:
     await scheduled_qa_audit(bot=_bot, google=_google, cache=_cache)
 
 
+async def _job_auto_email_retarget() -> None:
+    from src.bot.handlers.email_campaigns import auto_email_retarget
+    await auto_email_retarget(bot=_bot, google=_google, cache=_cache)
+
+
 # ── Команды бота ────────────────────────────────────────────────────────
 
 # Команды для всех пользователей
@@ -106,6 +111,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="admin", description="Панель управления"),
     BotCommand(command="broadcast", description="Рассылка (#сегмент)"),
     BotCommand(command="report", description="Dashboard 24ч"),
+    BotCommand(command="email_campaign", description="Email-ретаргетинг"),
     BotCommand(command="refresh", description="Сброс кеша"),
     BotCommand(command="consult", description="Задать вопрос юристу"),
     BotCommand(command="booking", description="Запись на консультацию"),
@@ -288,6 +294,17 @@ async def main() -> None:
         day_of_week="fri",
         hour=16, minute=0,
         id="weekly_qa_audit",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Авто email-ретаргетинг: еженедельно (четверг 10:00 UTC = 16:00 Алматы)
+    scheduler.add_job(
+        _job_auto_email_retarget,
+        trigger="cron",
+        day_of_week="thu",
+        hour=10, minute=0,
+        id="weekly_email_retarget",
         replace_existing=True,
         misfire_grace_time=3600,
     )
