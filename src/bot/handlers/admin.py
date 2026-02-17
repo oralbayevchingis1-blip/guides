@@ -687,6 +687,239 @@ async def cmd_promo(
     await message.answer(links)
 
 
+@router.message(Command("ads"))
+async def cmd_ads(
+    message: Message,
+    bot: Bot,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Генерация рекламных креативов: /ads <guide_id>.
+
+    Создаёт готовые тексты для Facebook/Instagram/Telegram Ads
+    с UTM-tagged deep links и рекомендациями по таргетингу.
+    Без аргумента — показывает список гайдов.
+    """
+    if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
+        return
+
+    args = (message.text or "").split(maxsplit=1)
+    guide_id = args[1].strip() if len(args) > 1 else ""
+
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+
+    if not guide_id:
+        if not catalog:
+            await message.answer("📚 Каталог пуст.")
+            return
+
+        from src.database.crud import count_guide_downloads_bulk
+        gids = [str(g.get("id", "")) for g in catalog if g.get("id")]
+        dl_counts = await count_guide_downloads_bulk(gids)
+
+        lines = ["📣 <b>Выберите гайд для рекламных креативов:</b>\n"]
+        for g in catalog:
+            gid = g.get("id", "?")
+            title = g.get("title", gid)[:35]
+            dl = dl_counts.get(gid, 0)
+            lines.append(f"  📄 <code>{gid}</code> — {title} ({dl} скач.)")
+        lines.append(f"\n<code>/ads guide_id</code>")
+        await message.answer("\n".join(lines))
+        return
+
+    guide = None
+    for g in catalog:
+        if str(g.get("id", "")) == guide_id:
+            guide = g
+            break
+
+    if not guide:
+        await message.answer(f"❌ Гайд <code>{guide_id}</code> не найден.")
+        return
+
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username
+
+    from src.database.crud import count_guide_downloads
+    dl_count = await count_guide_downloads(guide_id)
+
+    from src.bot.utils.promo import build_ad_creatives
+    ads = build_ad_creatives(guide, bot_username, download_count=dl_count)
+
+    # 1. Facebook / Instagram Ads
+    await message.answer(
+        f"📘 <b>1. Facebook / Instagram Ads</b>\n{'─' * 28}\n\n"
+        f"<b>Primary text:</b>\n<code>{html.escape(ads['fb_primary_text'])}</code>\n\n"
+        f"<b>Headline:</b>\n<code>{html.escape(ads['fb_headline'])}</code>\n\n"
+        f"<b>Description:</b>\n<code>{html.escape(ads['fb_description'])}</code>\n\n"
+        f"<b>Link:</b>\n<code>{html.escape(ads['fb_link'])}</code>"
+    )
+
+    # 2. Instagram Stories
+    await message.answer(
+        f"📸 <b>2. Instagram Stories</b>\n{'─' * 28}\n\n"
+        f"<code>{html.escape(ads['ig_story_text'])}</code>\n\n"
+        f"<b>Link:</b>\n<code>{html.escape(ads['ig_link'])}</code>"
+    )
+
+    # 3. Telegram Ads
+    await message.answer(
+        f"✈️ <b>3. Telegram Ads</b> (макс 160 симв.)\n{'─' * 28}\n\n"
+        f"<code>{html.escape(ads['tg_ad_text'])}</code>\n\n"
+        f"<b>Link:</b>\n<code>{html.escape(ads['tg_link'])}</code>"
+    )
+
+    # 4. Таргетинг + Campaign ID
+    await message.answer(
+        f"🎯 <b>4. Рекомендации по таргетингу</b>\n{'─' * 28}\n\n"
+        f"<b>Аудитория:</b>\n{html.escape(ads['target_audience'])}\n\n"
+        f"<b>Campaign ID:</b> <code>{ads['campaign_id']}</code>\n\n"
+        f"ℹ️ {html.escape(ads['utm_note'])}\n\n"
+        f"💡 После запуска кампании:\n"
+        f"  1. <code>/ads_spend {ads['campaign_id']} facebook 50000</code>\n"
+        f"     (создаст кампанию и запишет бюджет)\n"
+        f"  2. Обновляйте расход через ту же команду\n"
+        f"  3. <code>/ads_stats</code> — CPL и конверсии"
+    )
+
+
+@router.message(Command("ads_spend"))
+async def cmd_ads_spend(message: Message) -> None:
+    """Записывает расход на рекламную кампанию: /ads_spend <campaign_id> <platform> <spent>.
+
+    Пример: /ads_spend ads_taxes facebook 50000
+    """
+    if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
+        return
+
+    args = (message.text or "").split()
+    if len(args) < 4:
+        await message.answer(
+            "📊 <b>Запись расходов на рекламу</b>\n\n"
+            "Формат: <code>/ads_spend campaign_id platform spent</code>\n\n"
+            "Примеры:\n"
+            "  <code>/ads_spend ads_taxes facebook 50000</code>\n"
+            "  <code>/ads_spend ads_labor instagram 25000</code>\n"
+            "  <code>/ads_spend ads_ip telegram_ads 15000</code>\n\n"
+            "Платформы: facebook, instagram, telegram_ads, google, linkedin\n"
+            "Сумма в KZT (без пробелов)"
+        )
+        return
+
+    campaign_id = args[1].strip()
+    platform = args[2].strip().lower()
+    try:
+        spent = float(args[3].strip().replace(",", "."))
+    except ValueError:
+        await message.answer("❌ Некорректная сумма. Пример: <code>/ads_spend ads_taxes facebook 50000</code>")
+        return
+
+    from src.database.crud import create_ad_campaign, update_ad_spend
+
+    # Создаём кампанию, если её ещё нет
+    guide_id = campaign_id.removeprefix("ads_") if campaign_id.startswith("ads_") else ""
+    await create_ad_campaign(
+        campaign_id=campaign_id,
+        platform=platform,
+        guide_id=guide_id,
+        name=f"Paid: {guide_id or campaign_id}",
+        budget=spent,
+    )
+
+    # Обновляем расход
+    await update_ad_spend(campaign_id, spent)
+
+    await message.answer(
+        f"✅ Расход записан:\n\n"
+        f"🆔 Campaign: <code>{campaign_id}</code>\n"
+        f"📱 Платформа: <b>{platform}</b>\n"
+        f"💰 Потрачено: <b>{spent:,.0f} KZT</b>\n\n"
+        f"📊 Полная аналитика: /ads_stats"
+    )
+
+
+@router.message(Command("ads_stats"))
+async def cmd_ads_stats(message: Message) -> None:
+    """Аналитика рекламных кампаний: CPL, конверсии, ROI по платформам."""
+    if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
+        return
+
+    try:
+        from src.database.crud import get_ad_campaigns, get_ad_campaign_summary
+
+        summary = await get_ad_campaign_summary()
+
+        if summary["campaigns_count"] == 0:
+            await message.answer(
+                "📊 <b>Рекламные кампании</b>\n\n"
+                "<i>Пока нет данных. Чтобы начать:</i>\n"
+                "1. <code>/ads guide_id</code> — сгенерировать креативы\n"
+                "2. Запустить рекламу с UTM-ссылками\n"
+                "3. <code>/ads_spend campaign_id platform сумма</code>\n"
+                "4. <code>/ads_stats</code> — увидеть CPL"
+            )
+            return
+
+        lines = [
+            "📊 <b>Аналитика рекламных кампаний</b>",
+            "═" * 28,
+            "",
+        ]
+
+        # Общая сводка
+        lines.append(
+            f"💰 Потрачено: <b>{summary['total_spent']:,.0f} KZT</b>\n"
+            f"📥 Лидов (скачиваний): <b>{summary['total_leads']}</b>\n"
+            f"📞 Консультаций: <b>{summary['total_consults']}</b>\n"
+            f"📊 Средний CPL: <b>{summary['avg_cpl']:,.0f} KZT</b>"
+        )
+
+        # По платформам
+        if summary["by_platform"]:
+            lines.append(f"\n\n{'─' * 28}")
+            lines.append("📱 <b>По платформам:</b>\n")
+            platform_icons = {
+                "facebook": "📘", "instagram": "📸",
+                "telegram_ads": "✈️", "google": "🔍", "linkedin": "💼",
+            }
+            for platform, data in summary["by_platform"].items():
+                icon = platform_icons.get(platform, "📱")
+                cpl = data.get("cpl", 0)
+                lines.append(
+                    f"  {icon} <b>{platform}</b>\n"
+                    f"     💰 {data['spent']:,.0f} KZT → "
+                    f"📥 {data['leads']} лидов"
+                    + (f" · CPL: <b>{cpl:,.0f}</b>" if cpl > 0 else "")
+                )
+
+        # Детали по кампаниям
+        campaigns = await get_ad_campaigns()
+        if campaigns:
+            lines.append(f"\n\n{'─' * 28}")
+            lines.append("📋 <b>Кампании (детально):</b>\n")
+            for c in campaigns[:10]:
+                status_icon = "🟢" if c["status"] == "active" else "🔴"
+                cpl_str = f"{c['cpl']:,.0f}" if c["cpl"] > 0 else "—"
+                lines.append(
+                    f"  {status_icon} <code>{c['campaign_id']}</code>\n"
+                    f"     {c['platform']} · "
+                    f"💰 {c['spent']:,.0f} → "
+                    f"📥 {c['downloads']} · "
+                    f"CPL: <b>{cpl_str}</b>"
+                )
+
+        lines.append(
+            f"\n\n💡 Обновить расход: <code>/ads_spend campaign_id platform сумма</code>\n"
+            f"💡 Конверсии по UTM: /sources"
+        )
+
+        await message.answer("\n".join(lines))
+
+    except Exception as e:
+        logger.error("Ads stats error: %s", e, exc_info=True)
+        await message.answer(f"❌ Ошибка: {e}")
+
+
 @router.message(Command("digest"))
 async def cmd_digest(message: Message, bot: Bot) -> None:
     """Принудительная отправка дайджеста: /digest или /digest week."""

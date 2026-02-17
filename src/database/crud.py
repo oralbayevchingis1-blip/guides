@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy import func as sa_func
 
-from src.database.models import ConsentLog, FunnelEvent, Lead, Question, Referral, ScheduledTask, TopicSubscription, User, async_session
+from src.database.models import AdCampaign, ConsentLog, FunnelEvent, Lead, Question, Referral, ScheduledTask, TopicSubscription, User, async_session
 
 logger = logging.getLogger(__name__)
 
@@ -1053,3 +1053,185 @@ async def get_leads_by_user(user_id: int) -> list:
         stmt = select(Lead).where(Lead.user_id == user_id)
         result = await session.execute(stmt)
         return list(result.scalars().all())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  AD CAMPAIGNS
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def create_ad_campaign(
+    campaign_id: str,
+    platform: str,
+    *,
+    guide_id: str = "",
+    name: str = "",
+    budget: float = 0.0,
+    currency: str = "KZT",
+) -> None:
+    """Создаёт рекламную кампанию."""
+    async with async_session() as session:
+        existing = await session.execute(
+            select(AdCampaign).where(AdCampaign.campaign_id == campaign_id)
+        )
+        if existing.scalar_one_or_none():
+            logger.info("Ad campaign %s already exists", campaign_id)
+            return
+        campaign = AdCampaign(
+            campaign_id=campaign_id,
+            platform=platform,
+            guide_id=guide_id or None,
+            name=name,
+            budget=budget,
+            currency=currency,
+        )
+        session.add(campaign)
+        await session.commit()
+        logger.info("Ad campaign created: %s (%s)", campaign_id, platform)
+
+
+async def update_ad_spend(campaign_id: str, spent: float) -> None:
+    """Обновляет потраченную сумму кампании."""
+    async with async_session() as session:
+        stmt = (
+            update(AdCampaign)
+            .where(AdCampaign.campaign_id == campaign_id)
+            .values(spent=spent)
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+async def close_ad_campaign(campaign_id: str, total_spent: float | None = None) -> None:
+    """Закрывает кампанию (статус=closed, финальные расходы)."""
+    async with async_session() as session:
+        values: dict = {
+            "status": "closed",
+            "ended_at": datetime.now(timezone.utc),
+        }
+        if total_spent is not None:
+            values["spent"] = total_spent
+        stmt = (
+            update(AdCampaign)
+            .where(AdCampaign.campaign_id == campaign_id)
+            .values(**values)
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+async def get_ad_campaigns(status: str | None = None) -> list[dict]:
+    """Возвращает рекламные кампании с аналитикой конверсий.
+
+    Returns:
+        Список словарей с полями кампании + starts, downloads, cpl.
+    """
+    from sqlalchemy import case as sa_case
+
+    async with async_session() as session:
+        stmt = select(AdCampaign).order_by(AdCampaign.started_at.desc())
+        if status:
+            stmt = stmt.where(AdCampaign.status == status)
+        result = await session.execute(stmt)
+        campaigns = list(result.scalars().all())
+
+    if not campaigns:
+        return []
+
+    # Собираем конверсии из FunnelEvent по campaign_id
+    campaign_ids = [c.campaign_id for c in campaigns]
+    async with async_session() as session:
+        from sqlalchemy import case as sa_case
+
+        # Ищем события с source, содержащим campaign_id
+        rows = []
+        for cid in campaign_ids:
+            pattern = f"%{cid}%"
+            stmt = select(
+                sa_func.count().label("starts"),
+                sa_func.sum(
+                    sa_case(
+                        (FunnelEvent.step == "pdf_delivered", 1),
+                        else_=0,
+                    )
+                ).label("downloads"),
+                sa_func.sum(
+                    sa_case(
+                        (FunnelEvent.step == "consultation", 1),
+                        else_=0,
+                    )
+                ).label("consults"),
+            ).where(
+                FunnelEvent.source.like(pattern)
+                | FunnelEvent.meta.like(pattern)
+            )
+            r = await session.execute(stmt)
+            row = r.one()
+            rows.append((cid, row.starts or 0, row.downloads or 0, row.consults or 0))
+
+    conv_map = {cid: (s, d, co) for cid, s, d, co in rows}
+
+    result_list = []
+    for c in campaigns:
+        starts, downloads, consults = conv_map.get(c.campaign_id, (0, 0, 0))
+        cpl = c.spent / downloads if downloads > 0 else 0.0
+        cpc = c.spent / consults if consults > 0 else 0.0
+        result_list.append({
+            "campaign_id": c.campaign_id,
+            "platform": c.platform,
+            "guide_id": c.guide_id or "",
+            "name": c.name,
+            "budget": c.budget,
+            "spent": c.spent,
+            "currency": c.currency,
+            "status": c.status,
+            "started_at": c.started_at,
+            "starts": starts,
+            "downloads": downloads,
+            "consults": consults,
+            "cpl": round(cpl, 2),
+            "cost_per_consult": round(cpc, 2),
+        })
+
+    return result_list
+
+
+async def get_ad_campaign_summary() -> dict:
+    """Общая сводка по всем рекламным кампаниям.
+
+    Returns:
+        {total_spent, total_leads, total_consults, avg_cpl, campaigns_count, by_platform}
+    """
+    campaigns = await get_ad_campaigns()
+    if not campaigns:
+        return {
+            "total_spent": 0, "total_leads": 0, "total_consults": 0,
+            "avg_cpl": 0, "campaigns_count": 0, "by_platform": {},
+        }
+
+    total_spent = sum(c["spent"] for c in campaigns)
+    total_leads = sum(c["downloads"] for c in campaigns)
+    total_consults = sum(c["consults"] for c in campaigns)
+    avg_cpl = total_spent / total_leads if total_leads > 0 else 0
+
+    by_platform: dict[str, dict] = {}
+    for c in campaigns:
+        p = c["platform"]
+        if p not in by_platform:
+            by_platform[p] = {"spent": 0, "leads": 0, "consults": 0}
+        by_platform[p]["spent"] += c["spent"]
+        by_platform[p]["leads"] += c["downloads"]
+        by_platform[p]["consults"] += c["consults"]
+
+    for p in by_platform:
+        bp = by_platform[p]
+        bp["cpl"] = round(bp["spent"] / bp["leads"], 2) if bp["leads"] > 0 else 0
+
+    return {
+        "total_spent": round(total_spent, 2),
+        "total_leads": total_leads,
+        "total_consults": total_consults,
+        "avg_cpl": round(avg_cpl, 2),
+        "campaigns_count": len(campaigns),
+        "by_platform": by_platform,
+    }

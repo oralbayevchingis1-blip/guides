@@ -493,3 +493,145 @@ def _build_email_snippet(
 
     parts.append("</td></tr></table>")
     return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Рекламные креативы (Facebook Ads / Instagram Ads / Telegram Ads)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Аудитории по типу гайда
+_TARGET_AUDIENCES: dict[str, str] = {
+    "налог": "предприниматели, бухгалтеры, финдиректора; интересы: налоги, бухгалтерия, бизнес в Казахстане",
+    "труд": "HR-менеджеры, руководители; интересы: трудовое право, кадровый учёт",
+    "it": "IT-директора, стартаперы; интересы: IT, стартапы, tech law",
+    "инвест": "инвесторы, финансисты; интересы: инвестиции, private equity, M&A",
+    "корпоратив": "учредители, директора ТОО; интересы: регистрация бизнеса, корпоративное право",
+    "m&a": "CEO, юристы; интересы: M&A, сделки, due diligence",
+    "договор": "юристы, бизнесмены; интересы: договоры, контракты, b2b",
+}
+
+_DEFAULT_AUDIENCE = "предприниматели в Казахстане; интересы: бизнес, юридические услуги, консалтинг"
+
+
+def build_ad_creatives(
+    guide: dict,
+    bot_username: str,
+    *,
+    download_count: int = 0,
+) -> dict[str, str]:
+    """Генерирует рекламные креативы для платного трафика.
+
+    Returns:
+        Словарь с ключами:
+        - ``fb_primary_text``  — основной текст для Facebook/Instagram Ads
+        - ``fb_headline``      — заголовок объявления
+        - ``fb_description``   — описание под заголовком
+        - ``fb_link``          — deep link с UTM (facebook/cpc)
+        - ``ig_story_text``    — короткий текст для Instagram Stories
+        - ``ig_link``          — deep link с UTM (instagram/cpc)
+        - ``tg_ad_text``       — текст для Telegram Ads
+        - ``tg_link``          — deep link с UTM (telegram_ads/cpc)
+        - ``target_audience``  — рекомендация по аудитории
+        - ``campaign_id``      — предложенный campaign_id для отслеживания
+        - ``utm_note``         — пояснение по UTM
+    """
+    gid = guide.get("id", "")
+    title = guide.get("title", gid)
+    desc = guide.get("description", "")
+    category = guide.get("category", "")
+    highlights = guide.get("highlights", "")
+    key_stat = guide.get("key_stat", "") or guide.get("statistic", "")
+
+    hook = _get_category_hook(category)
+    highlight_items = _parse_highlights(highlights)
+
+    # UTM deep links для каждой платформы
+    fb_link = f"https://t.me/{bot_username}?start=guide_{gid}--src_facebook--med_cpc"
+    ig_link = f"https://t.me/{bot_username}?start=guide_{gid}--src_instagram--med_cpc"
+    tg_link = f"https://t.me/{bot_username}?start=guide_{gid}--src_telegram_ads--med_cpc"
+
+    # Campaign ID (для отслеживания)
+    campaign_id = f"ads_{gid}"
+
+    # ── Facebook / Instagram primary text ─────────────────────────────
+    fb_parts = []
+    if key_stat:
+        fb_parts.append(f"📊 {key_stat}")
+    else:
+        fb_parts.append(f"💡 {hook}")
+    fb_parts.append("")
+    fb_parts.append(f"Мы подготовили бесплатный гайд «{title}» — с готовыми шаблонами и чек-листами.")
+    if highlight_items:
+        fb_parts.append("")
+        for item in highlight_items[:3]:
+            fb_parts.append(f"✅ {item}")
+    if download_count >= 10:
+        fb_parts.append("")
+        fb_parts.append(f"📥 Уже скачали {download_count}+ предпринимателей")
+    fb_parts.append("")
+    fb_parts.append("Скачайте бесплатно — ссылка ниже 👇")
+    fb_primary = "\n".join(fb_parts)
+
+    # Facebook headline (макс ~40 символов)
+    fb_headline = f"Бесплатный гайд: {title}"
+    if len(fb_headline) > 40:
+        fb_headline = f"📚 {title}"[:40]
+
+    # Facebook description
+    fb_desc = desc[:125] + "…" if len(desc) > 125 else desc
+    if not fb_desc:
+        fb_desc = "PDF с шаблонами, чек-листами и примерами документов. Скачайте бесплатно."
+
+    # ── Instagram Stories text ────────────────────────────────────────
+    ig_parts = []
+    if key_stat:
+        ig_parts.append(f"📊 {key_stat}")
+    ig_parts.append(f"\n📚 «{title}»")
+    ig_parts.append("Бесплатный гайд с шаблонами")
+    if download_count >= 10:
+        ig_parts.append(f"📥 {download_count}+ скачиваний")
+    ig_parts.append("\n⬆️ Ссылка в профиле / свайп")
+    ig_story = "\n".join(ig_parts)
+
+    # ── Telegram Ads text (макс ~160 символов) ────────────────────────
+    tg_parts = [f"📚 {title}"]
+    if desc:
+        short_desc = desc.split(".")[0].strip()
+        if len(short_desc) <= 80:
+            tg_parts.append(short_desc + ".")
+    if download_count >= 10:
+        tg_parts.append(f"📥 {download_count}+ скачали")
+    tg_parts.append("Скачайте бесплатно →")
+    tg_ad = " ".join(tg_parts)
+    if len(tg_ad) > 160:
+        tg_ad = tg_ad[:157] + "..."
+
+    # ── Target audience recommendation ────────────────────────────────
+    cat_lower = category.lower()
+    audience = _DEFAULT_AUDIENCE
+    for key, aud in _TARGET_AUDIENCES.items():
+        if key in cat_lower:
+            audience = aud
+            break
+
+    # ── UTM note ──────────────────────────────────────────────────────
+    utm_note = (
+        f"При переходе по ссылке бот автоматически отслеживает источник "
+        f"(src=facebook/instagram/telegram_ads, med=cpc).\n"
+        f"Все конверсии видны в /sources и /ads_stats.\n"
+        f"Campaign ID для бюджета: {campaign_id}"
+    )
+
+    return {
+        "fb_primary_text": fb_primary,
+        "fb_headline": fb_headline,
+        "fb_description": fb_desc,
+        "fb_link": fb_link,
+        "ig_story_text": ig_story,
+        "ig_link": ig_link,
+        "tg_ad_text": tg_ad,
+        "tg_link": tg_link,
+        "target_audience": audience,
+        "campaign_id": campaign_id,
+        "utm_note": utm_note,
+    }

@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Index, Integer, String, Text
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -237,6 +237,41 @@ class Referral(Base):
 
     def __repr__(self) -> str:
         return f"<Referral(referrer={self.referrer_id}, referred={self.referred_id})>"
+
+
+class AdCampaign(Base):
+    """Рекламная кампания — трекинг расходов и конверсий.
+
+    Хранит данные о платных кампаниях (Facebook, Instagram, Telegram Ads)
+    для расчёта стоимости лида (CPL) и ROAS.
+    """
+
+    __tablename__ = "ad_campaigns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    platform: Mapped[str] = mapped_column(String(50), nullable=False)
+    guide_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    budget: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    spent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="KZT")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    ended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    __table_args__ = (
+        Index("ix_adcampaign_platform", "platform"),
+        Index("ix_adcampaign_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AdCampaign({self.campaign_id}, {self.platform}, spent={self.spent})>"
 
 
 # ──────────────────────── Инициализация ─────────────────────────────────
