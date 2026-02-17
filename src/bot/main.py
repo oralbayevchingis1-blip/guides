@@ -384,6 +384,16 @@ async def main() -> None:
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await _register_commands(bot)
+
+        # Сохраняем username бота для deep link генерации
+        try:
+            from src.bot.utils.retargeting import set_bot_username
+            me = await bot.get_me()
+            if me.username:
+                set_bot_username(me.username)
+        except Exception as e:
+            logger.warning("Failed to set bot username for retargeting: %s", e)
+
         set_ready(True)
         await dp.start_polling(bot)
     finally:

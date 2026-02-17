@@ -566,6 +566,16 @@ async def process_guide_download(
         metrics.inc("pdf_delivered")
         asyncio.create_task(track(user_id, "pdf_delivered", guide_id=guide_id, source=_src or None))
         pdf_sent = True
+
+    # Retargeting: Facebook Conversions API (fire-and-forget)
+    if pdf_sent and existing_lead:
+        try:
+            from src.bot.utils.retargeting import track_download_event
+            asyncio.create_task(track_download_event(
+                user_id, existing_lead.email, guide_id,
+            ))
+        except Exception:
+            pass
     else:
         await callback.message.answer(
             get_text(texts, "guide_pdf_unavailable", title=guide_title, description=guide_desc),
@@ -1087,6 +1097,13 @@ async def process_consent(
 
     # Воронка: согласие
     asyncio.create_task(track(user_id, "consent_given", guide_id=selected_guide, source=traffic_source or None))
+
+    # Retargeting: Facebook CompleteRegistration event
+    try:
+        from src.bot.utils.retargeting import track_registration_event
+        asyncio.create_task(track_registration_event(user_id, email))
+    except Exception:
+        pass
 
     # 1. SQLite
     await save_lead(

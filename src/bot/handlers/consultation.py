@@ -302,6 +302,13 @@ async def process_time(
     # Воронка: запись на консультацию
     asyncio.create_task(track(user_id, "consultation"))
 
+    # Retargeting: Facebook Schedule event
+    try:
+        from src.bot.utils.retargeting import track_consultation_event
+        asyncio.create_task(track_consultation_event(user_id, lead_email))
+    except Exception:
+        pass
+
     # Трекаем запись на консультацию (для подсчёта слотов)
     from src.database.crud import save_lead as _save_lead_consult
     try:
