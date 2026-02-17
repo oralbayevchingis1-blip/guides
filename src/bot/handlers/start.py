@@ -24,7 +24,15 @@ from src.bot.utils.cache import TTLCache
 from src.bot.utils.google_sheets import GoogleSheetsClient
 from src.bot.utils.subscription_check import check_subscription
 from src.constants import get_text
-from src.database.crud import get_or_create_user, get_lead_by_user_id, get_user_downloaded_guides, track
+from src.database.crud import (
+    cancel_tasks_for_user,
+    delete_leads_for_user,
+    delete_user,
+    get_lead_by_user_id,
+    get_or_create_user,
+    get_user_downloaded_guides,
+    track,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -400,6 +408,40 @@ async def reply_guides_button(
     await message.answer(
         "📚 <b>Выберите тему:</b>",
         reply_markup=categories_keyboard(catalog),
+    )
+
+
+@router.message(F.text == "🆕 Я новый пользователь")
+async def restart_as_new_user(
+    message: Message,
+    state: FSMContext,
+    cache: TTLCache,
+) -> None:
+    """Сбрасывает персональные данные/состояние и перезапускает флоу как для нового."""
+    user = message.from_user
+    if user is None:
+        return
+
+    user_id = user.id
+    leads_deleted = await delete_leads_for_user(user_id)
+    user_deleted = await delete_user(user_id)
+    tasks_cancelled = await cancel_tasks_for_user(user_id)
+    await state.clear()
+    cache.invalidate()
+
+    logger.info(
+        "User self-reset: user_id=%s, leads=%d, user=%s, tasks=%d",
+        user_id, leads_deleted, user_deleted, tasks_cancelled,
+    )
+
+    await message.answer(
+        "🧪 <b>Сброс выполнен!</b>\n\n"
+        f"• Лидов удалено: {leads_deleted}\n"
+        f"• Профиль удалён: {'да' if user_deleted else 'нет'}\n"
+        f"• Follow-up задач отменено: {tasks_cancelled}\n"
+        "• FSM очищен\n"
+        "• Кеш сброшен\n\n"
+        "Теперь нажмите /start — бот начнёт флоу как для нового пользователя."
     )
 
 

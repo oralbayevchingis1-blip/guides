@@ -46,6 +46,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """Постоянное меню внизу экрана."""
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="🆕 Я новый пользователь")],
             [KeyboardButton(text="📚 Гайды"), KeyboardButton(text="📂 Мои гайды")],
             [KeyboardButton(text="📞 Консультация"), KeyboardButton(text="❓ Задать вопрос")],
             [KeyboardButton(text="📩 Подписки")],
