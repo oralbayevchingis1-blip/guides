@@ -101,15 +101,22 @@ async def _ask_phone(message: Message, state: FSMContext, user_id: int) -> None:
     # Social proof с учётом сферы
     sphere = getattr(lead, "business_sphere", None) or "" if lead else ""
     case_line = ""
+    consult_pitch = ""
     if sphere:
         from src.bot.handlers.lead_form import SPHERE_CASES, _normalize_sphere
-        case = SPHERE_CASES.get(_normalize_sphere(sphere))
+        norm = _normalize_sphere(sphere)
+        case = SPHERE_CASES.get(norm)
         if case:
             case_line = f"\n\n💼 <i>{case}</i>"
+            consult_pitch = (
+                f"\n\nОбсудим вашу ситуацию — как мы уже делали "
+                f"с компаниями из сферы «{sphere}»."
+            )
     if not case_line:
         case_line = (
-            "\n\n✅ <i>Наши юристы уже провели 300+ консультаций "
-            "для бизнеса в Казахстане.</i>"
+            "\n\n✅ <i>Наши юристы провели 300+ консультаций "
+            "для бизнеса в Казахстане — обсудим вашу ситуацию, "
+            "как мы делали с десятками компаний.</i>"
         )
 
     # Urgency: дефицит слотов
@@ -122,6 +129,7 @@ async def _ask_phone(message: Message, state: FSMContext, user_id: int) -> None:
         "с нашим юристом.\n\n"
         "Это <b>бесплатно</b> и ни к чему не обязывает — "
         f"просто обсудим ваш вопрос за 15 минут.{case_line}"
+        f"{consult_pitch}"
         f"{scarcity_line}\n\n"
         "Укажите ваш номер телефона:",
         reply_markup=InlineKeyboardMarkup(
