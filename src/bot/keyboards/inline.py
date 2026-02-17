@@ -169,8 +169,14 @@ def consent_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура согласия на обработку данных."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Согласен", callback_data="give_consent")],
-            [InlineKeyboardButton(text="Нет, не хочу получать письма", callback_data="decline_consent")],
+            [InlineKeyboardButton(
+                text="✅ Согласен — отправьте гайд",
+                callback_data="give_consent",
+            )],
+            [InlineKeyboardButton(
+                text="Нет, спасибо",
+                callback_data="decline_consent",
+            )],
         ]
     )
 
