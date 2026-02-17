@@ -1,5 +1,6 @@
 """Админ-команды бота (только для ADMIN_ID)."""
 
+import html
 import io
 import logging
 from datetime import datetime, timezone, timedelta
@@ -648,19 +649,34 @@ async def cmd_promo(
         download_count=dl_count,
     )
 
+    # 1. Пост для канала
     await message.answer(
-        "📣 <b>Пост для канала:</b>\n\n" + "─" * 20,
+        "📣 <b>1. Пост для канала</b> (с хуком и превью)\n\n" + "─" * 20,
     )
     await message.answer(promo["channel_post"])
 
+    # 2. CTA-блок для Telegraph/статьи
     await message.answer(
-        "📝 <b>CTA-блок для статьи:</b>\n\n" + "─" * 20 + "\n\n"
+        "📝 <b>2. CTA для статьи (Telegraph)</b>\n\n" + "─" * 20 + "\n\n"
         + promo["telegraph_cta"],
     )
 
+    # 3. LinkedIn / Facebook пост
+    await message.answer(
+        "💼 <b>3. LinkedIn / Facebook пост</b>\n\n" + "─" * 20 + "\n\n"
+        + promo["linkedin_post"],
+    )
+
+    # 4. Email-сниппет (HTML)
+    await message.answer(
+        "📧 <b>4. Email-сниппет</b> (HTML — скопируйте):\n\n"
+        f"<code>{html.escape(promo['email_snippet'][:3000])}</code>",
+    )
+
+    # 5. Deep links
     from src.bot.handlers.content_manager import _make_deep_link
     links = (
-        "🔗 <b>Deep links с UTM:</b>\n\n"
+        "🔗 <b>5. Deep links с UTM:</b>\n\n"
         f"📱 Канал:\n<code>{_make_deep_link(bot_username, guide_id, 'channel')}</code>\n\n"
         f"📧 Email:\n<code>{_make_deep_link(bot_username, guide_id, 'email')}</code>\n\n"
         f"💼 LinkedIn:\n<code>{_make_deep_link(bot_username, guide_id, 'linkedin')}</code>\n\n"
