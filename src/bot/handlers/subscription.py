@@ -58,6 +58,11 @@ async def check_subscription_callback(
     # Подписка подтверждена
     await callback.answer("✅ Подписка подтверждена!")
     asyncio.create_task(track(user_id, "sub_confirmed"))
+    try:
+        from src.bot.utils.ab_testing import ab_convert
+        asyncio.create_task(ab_convert(user_id, "sub_confirmed"))
+    except Exception:
+        pass
     logger.info("Пользователь %s подтвердил подписку", user_id)
 
     # Stage 9: Барьер 2 — проверяем наличие email в CRM

@@ -274,6 +274,61 @@ class AdCampaign(Base):
         return f"<AdCampaign({self.campaign_id}, {self.platform}, spent={self.spent})>"
 
 
+class ABExperiment(Base):
+    """A/B тест — определяет эксперимент с двумя вариантами текста/логики.
+
+    Variants хранятся как JSON: {"A": "текст A", "B": "текст B"}
+    metric — какой funnel step считается конверсией (pdf_delivered, consultation, etc.)
+    """
+
+    __tablename__ = "ab_experiments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    description: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    variants_json: Mapped[str] = mapped_column(Text, nullable=False)
+    metric: Mapped[str] = mapped_column(String(50), nullable=False, default="pdf_delivered")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_ab_experiment_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ABExperiment({self.name}, status={self.status})>"
+
+
+class ABAssignment(Base):
+    """Назначение пользователя на вариант A/B теста."""
+
+    __tablename__ = "ab_assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    variant: Mapped[str] = mapped_column(String(10), nullable=False)
+    converted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    converted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    __table_args__ = (
+        Index("ix_ab_assign_exp_user", "experiment_name", "user_id", unique=True),
+        Index("ix_ab_assign_exp_variant", "experiment_name", "variant"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ABAssignment({self.experiment_name}, user={self.user_id}, v={self.variant})>"
+
+
 # ──────────────────────── Инициализация ─────────────────────────────────
 
 async def init_db() -> None:

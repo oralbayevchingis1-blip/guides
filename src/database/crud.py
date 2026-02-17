@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy import func as sa_func
 
-from src.database.models import AdCampaign, ConsentLog, FunnelEvent, Lead, Question, Referral, ScheduledTask, TopicSubscription, User, async_session
+from src.database.models import ABAssignment, ABExperiment, AdCampaign, ConsentLog, FunnelEvent, Lead, Question, Referral, ScheduledTask, TopicSubscription, User, async_session
 
 logger = logging.getLogger(__name__)
 
@@ -1357,3 +1357,219 @@ async def get_ad_campaign_summary() -> dict:
         "campaigns_count": len(campaigns),
         "by_platform": by_platform,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  A/B TESTING
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def create_ab_experiment(
+    name: str,
+    variants: dict[str, str],
+    *,
+    description: str = "",
+    metric: str = "pdf_delivered",
+) -> bool:
+    """Создаёт A/B эксперимент. Возвращает True если создан."""
+    async with async_session() as session:
+        existing = await session.execute(
+            select(ABExperiment).where(ABExperiment.name == name)
+        )
+        if existing.scalar_one_or_none():
+            return False
+        exp = ABExperiment(
+            name=name,
+            description=description,
+            variants_json=json.dumps(variants, ensure_ascii=False),
+            metric=metric,
+        )
+        session.add(exp)
+        await session.commit()
+        logger.info("AB experiment created: %s", name)
+        return True
+
+
+async def get_ab_experiment(name: str) -> dict | None:
+    """Возвращает эксперимент по имени."""
+    async with async_session() as session:
+        stmt = select(ABExperiment).where(ABExperiment.name == name)
+        result = await session.execute(stmt)
+        exp = result.scalar_one_or_none()
+        if not exp:
+            return None
+        return {
+            "name": exp.name,
+            "description": exp.description,
+            "variants": json.loads(exp.variants_json),
+            "metric": exp.metric,
+            "status": exp.status,
+            "created_at": exp.created_at,
+        }
+
+
+async def get_active_experiments() -> list[dict]:
+    """Возвращает все активные A/B эксперименты."""
+    async with async_session() as session:
+        stmt = select(ABExperiment).where(ABExperiment.status == "active")
+        result = await session.execute(stmt)
+        experiments = []
+        for exp in result.scalars().all():
+            experiments.append({
+                "name": exp.name,
+                "description": exp.description,
+                "variants": json.loads(exp.variants_json),
+                "metric": exp.metric,
+                "status": exp.status,
+            })
+        return experiments
+
+
+async def assign_ab_variant(
+    experiment_name: str,
+    user_id: int,
+    variant: str,
+) -> None:
+    """Назначает пользователю вариант (если ещё не назначен)."""
+    async with async_session() as session:
+        existing = await session.execute(
+            select(ABAssignment).where(
+                ABAssignment.experiment_name == experiment_name,
+                ABAssignment.user_id == user_id,
+            )
+        )
+        if existing.scalar_one_or_none():
+            return
+        assignment = ABAssignment(
+            experiment_name=experiment_name,
+            user_id=user_id,
+            variant=variant,
+        )
+        session.add(assignment)
+        await session.commit()
+
+
+async def get_user_ab_variant(experiment_name: str, user_id: int) -> str | None:
+    """Возвращает вариант, назначенный пользователю, или None."""
+    async with async_session() as session:
+        stmt = select(ABAssignment.variant).where(
+            ABAssignment.experiment_name == experiment_name,
+            ABAssignment.user_id == user_id,
+        )
+        result = await session.execute(stmt)
+        row = result.scalar_one_or_none()
+        return row
+
+
+async def mark_ab_conversion(experiment_name: str, user_id: int) -> None:
+    """Отмечает конверсию пользователя в эксперименте."""
+    async with async_session() as session:
+        stmt = (
+            update(ABAssignment)
+            .where(
+                ABAssignment.experiment_name == experiment_name,
+                ABAssignment.user_id == user_id,
+                ABAssignment.converted == False,  # noqa: E712
+            )
+            .values(converted=True, converted_at=datetime.now(timezone.utc))
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+async def get_ab_results(experiment_name: str) -> dict:
+    """Результаты A/B теста с конверсией по вариантам.
+
+    Returns:
+        {
+            "experiment": str,
+            "variants": {
+                "A": {"users": N, "conversions": N, "rate": float},
+                "B": {"users": N, "conversions": N, "rate": float},
+            },
+            "winner": "A" | "B" | None,
+            "confidence": str,  # "low" | "medium" | "high"
+            "lift": float,  # % improvement of best over worst
+        }
+    """
+    async with async_session() as session:
+        from sqlalchemy import case as sa_case
+
+        stmt = (
+            select(
+                ABAssignment.variant,
+                sa_func.count().label("users"),
+                sa_func.sum(
+                    sa_case(
+                        (ABAssignment.converted == True, 1),  # noqa: E712
+                        else_=0,
+                    )
+                ).label("conversions"),
+            )
+            .where(ABAssignment.experiment_name == experiment_name)
+            .group_by(ABAssignment.variant)
+        )
+        result = await session.execute(stmt)
+        rows = result.all()
+
+    variants: dict[str, dict] = {}
+    for variant, users, conversions in rows:
+        conversions = conversions or 0
+        rate = (conversions / users * 100) if users > 0 else 0
+        variants[variant] = {
+            "users": users,
+            "conversions": conversions,
+            "rate": round(rate, 2),
+        }
+
+    # Determine winner
+    winner = None
+    lift = 0.0
+    confidence = "low"
+
+    rates = {v: d["rate"] for v, d in variants.items()}
+    counts = {v: d["users"] for v, d in variants.items()}
+
+    if len(rates) >= 2:
+        sorted_v = sorted(rates.items(), key=lambda x: -x[1])
+        best_v, best_r = sorted_v[0]
+        worst_v, worst_r = sorted_v[-1]
+
+        if worst_r > 0:
+            lift = ((best_r - worst_r) / worst_r) * 100
+        elif best_r > 0:
+            lift = 100.0
+
+        total_users = sum(counts.values())
+        total_conversions = sum(d["conversions"] for d in variants.values())
+
+        if total_users >= 100 and lift > 10:
+            confidence = "high"
+            winner = best_v
+        elif total_users >= 50 and lift > 5:
+            confidence = "medium"
+            winner = best_v
+        elif total_users >= 20 and lift > 20:
+            confidence = "medium"
+            winner = best_v
+
+    return {
+        "experiment": experiment_name,
+        "variants": variants,
+        "winner": winner,
+        "confidence": confidence,
+        "lift": round(lift, 1),
+    }
+
+
+async def stop_ab_experiment(name: str, winner: str = "") -> bool:
+    """Останавливает эксперимент. Опционально фиксирует победителя."""
+    async with async_session() as session:
+        stmt = select(ABExperiment).where(ABExperiment.name == name)
+        result = await session.execute(stmt)
+        exp = result.scalar_one_or_none()
+        if not exp:
+            return False
+        exp.status = f"closed:{winner}" if winner else "closed"
+        await session.commit()
+        return True

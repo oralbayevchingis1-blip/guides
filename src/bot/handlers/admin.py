@@ -263,6 +263,7 @@ async def cmd_health(
         "\n💡 /profiles — профили пользователей"
         "\n💡 /questions — вопросы юристу"
         "\n💡 /digest — ежедневный дайджест"
+        "\n💡 /ab_results — A/B тесты"
     )
 
     await message.answer(text)
@@ -815,6 +816,210 @@ async def cmd_funnel_export(
     except Exception as e:
         logger.error("Funnel export error: %s", e, exc_info=True)
         await message.answer(f"❌ Ошибка экспорта: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  A/B Testing
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.message(Command("ab_create"))
+async def cmd_ab_create(message: Message, state: FSMContext) -> None:
+    """Создание A/B эксперимента: /ab_create name metric
+    variant_a_text ||| variant_b_text
+
+    Пример:
+        /ab_create welcome_cta pdf_delivered
+        Выберите тему — получите гайд бесплатно ||| Скачайте гайд с шаблонами и чек-листами
+    """
+    if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
+        return
+
+    text = (message.text or "").strip()
+    lines = text.split("\n", 1)
+    first_line = lines[0].strip()
+    args = first_line.split(maxsplit=2)
+
+    if len(args) < 3 or len(lines) < 2 or "|||" not in lines[1]:
+        await message.answer(
+            "🧪 <b>Создание A/B теста</b>\n\n"
+            "Формат:\n"
+            "<code>/ab_create имя метрика\n"
+            "Текст варианта A ||| Текст варианта B</code>\n\n"
+            "Пример:\n"
+            "<code>/ab_create welcome_cta pdf_delivered\n"
+            "Выберите тему — получите гайд 📚 ||| Скачайте гайд с шаблонами бесплатно 📥</code>\n\n"
+            "Имена экспериментов (встроенные точки интеграции):\n"
+            "  • <code>welcome_cta</code> — CTA в приветствии\n"
+            "  • <code>email_prompt</code> — текст запроса email\n"
+            "  • <code>sub_prompt</code> — текст барьера подписки\n"
+            "  • <code>download_cta</code> — кнопка «Скачать»\n"
+            "  • <code>post_download</code> — текст после скачивания\n\n"
+            "Метрики: pdf_delivered, consultation, email_submitted, sub_confirmed"
+        )
+        return
+
+    name = args[1].strip()
+    metric = args[2].strip()
+    variants_raw = lines[1].strip()
+    parts = [p.strip() for p in variants_raw.split("|||")]
+
+    if len(parts) < 2:
+        await message.answer("❌ Нужно два варианта, разделённых <code>|||</code>")
+        return
+
+    variants = {"A": parts[0], "B": parts[1]}
+
+    from src.database.crud import create_ab_experiment
+    ok = await create_ab_experiment(name, variants, metric=metric)
+
+    if ok:
+        from src.bot.utils.ab_testing import refresh_experiments_cache
+        await refresh_experiments_cache()
+
+        await message.answer(
+            f"✅ <b>A/B тест создан!</b>\n\n"
+            f"🧪 Имя: <code>{name}</code>\n"
+            f"📊 Метрика: <code>{metric}</code>\n\n"
+            f"<b>Вариант A:</b>\n{html.escape(variants['A'][:200])}\n\n"
+            f"<b>Вариант B:</b>\n{html.escape(variants['B'][:200])}\n\n"
+            f"Пользователи будут автоматически распределяться 50/50.\n"
+            f"Результаты: /ab_results"
+        )
+    else:
+        await message.answer(f"❌ Эксперимент <code>{name}</code> уже существует.")
+
+
+@router.message(Command("ab_results"))
+async def cmd_ab_results(message: Message) -> None:
+    """Результаты A/B тестов: /ab_results или /ab_results name."""
+    if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
+        return
+
+    args = (message.text or "").split(maxsplit=1)
+    specific = args[1].strip() if len(args) > 1 else ""
+
+    try:
+        from src.database.crud import get_ab_results, get_active_experiments, get_ab_experiment
+
+        if specific:
+            # Конкретный эксперимент
+            exp = await get_ab_experiment(specific)
+            if not exp:
+                await message.answer(f"❌ Эксперимент <code>{specific}</code> не найден.")
+                return
+
+            results = await get_ab_results(specific)
+            await message.answer(_format_ab_results(exp, results))
+        else:
+            # Все активные + недавно закрытые
+            experiments = await get_active_experiments()
+            if not experiments:
+                await message.answer(
+                    "🧪 <b>A/B тесты</b>\n\n"
+                    "<i>Нет активных экспериментов.</i>\n\n"
+                    "Создать: /ab_create"
+                )
+                return
+
+            for exp in experiments:
+                results = await get_ab_results(exp["name"])
+                await message.answer(_format_ab_results(exp, results))
+
+    except Exception as e:
+        logger.error("AB results error: %s", e, exc_info=True)
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+def _format_ab_results(exp: dict, results: dict) -> str:
+    """Форматирует результаты A/B теста для отправки."""
+    name = exp["name"]
+    metric = exp.get("metric", "?")
+    status = exp.get("status", "active")
+
+    lines = [
+        f"🧪 <b>A/B: {html.escape(name)}</b>",
+        f"📊 Метрика: <code>{metric}</code> · Статус: {status}",
+        "",
+    ]
+
+    variants = results.get("variants", {})
+    total_users = sum(v["users"] for v in variants.values())
+
+    for v_key in sorted(variants.keys()):
+        v = variants[v_key]
+        users = v["users"]
+        conversions = v["conversions"]
+        rate = v["rate"]
+
+        bar_len = max(1, round(rate / 5)) if rate > 0 else 1
+        bar = "█" * bar_len + "░" * (20 - bar_len)
+
+        # Показываем превью текста варианта
+        variant_text = exp.get("variants", {}).get(v_key, "")
+        preview = variant_text[:60] + "…" if len(variant_text) > 60 else variant_text
+
+        lines.append(
+            f"<b>Вариант {v_key}</b> ({users} чел.)\n"
+            f"  <i>«{html.escape(preview)}»</i>\n"
+            f"  {bar} <b>{rate:.1f}%</b> ({conversions}/{users})"
+        )
+
+    # Winner
+    winner = results.get("winner")
+    confidence = results.get("confidence", "low")
+    lift = results.get("lift", 0)
+
+    confidence_icons = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+    conf_icon = confidence_icons.get(confidence, "⚪")
+
+    if winner:
+        lines.append(
+            f"\n🏆 <b>Лидер: вариант {winner}</b> "
+            f"(+{lift:.0f}% lift, {conf_icon} {confidence} confidence)"
+        )
+    else:
+        lines.append(f"\n⏳ Пока недостаточно данных ({total_users} чел.)")
+
+    lines.append(
+        f"\n💡 Остановить: <code>/ab_stop {name}</code>"
+        + (f"\n💡 Применить победителя: <code>/ab_stop {name} {winner}</code>" if winner else "")
+    )
+
+    return "\n".join(lines)
+
+
+@router.message(Command("ab_stop"))
+async def cmd_ab_stop(message: Message) -> None:
+    """Остановить A/B тест: /ab_stop name [winner]."""
+    if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
+        return
+
+    args = (message.text or "").split()
+    if len(args) < 2:
+        await message.answer(
+            "Формат: <code>/ab_stop имя_теста</code>\n"
+            "С победителем: <code>/ab_stop имя_теста A</code>"
+        )
+        return
+
+    name = args[1].strip()
+    winner = args[2].strip() if len(args) > 2 else ""
+
+    from src.database.crud import stop_ab_experiment
+    ok = await stop_ab_experiment(name, winner)
+
+    if ok:
+        from src.bot.utils.ab_testing import refresh_experiments_cache
+        await refresh_experiments_cache()
+
+        msg = f"✅ Эксперимент <code>{name}</code> остановлен."
+        if winner:
+            msg += f"\n🏆 Победитель: <b>вариант {winner}</b>"
+            msg += "\n\n💡 Теперь обновите текст в Google Sheets на текст победителя."
+        await message.answer(msg)
+    else:
+        await message.answer(f"❌ Эксперимент <code>{name}</code> не найден.")
 
 
 @router.message(Command("promo"))

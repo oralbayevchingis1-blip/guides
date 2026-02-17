@@ -302,6 +302,13 @@ async def process_time(
     # Воронка: запись на консультацию
     asyncio.create_task(track(user_id, "consultation"))
 
+    # A/B testing: отметить конверсию
+    try:
+        from src.bot.utils.ab_testing import ab_convert
+        asyncio.create_task(ab_convert(user_id, "consultation"))
+    except Exception:
+        pass
+
     # Retargeting: Facebook Schedule event
     try:
         from src.bot.utils.retargeting import track_consultation_event

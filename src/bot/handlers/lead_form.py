@@ -799,7 +799,9 @@ async def process_guide_download(
     if not existing_lead:
         asyncio.create_task(track(user_id, "email_prompt", guide_id=guide_id))
         await callback.answer()
-        await callback.message.answer(
+
+        # A/B тест текста запроса email
+        default_email_text = (
             "📨 <b>Куда прислать гайд?</b>\n\n"
             "Укажите email — на него придёт:\n"
             "  📎 ссылка на PDF (чтобы не потерять)\n"
@@ -808,6 +810,13 @@ async def process_guide_download(
             "Отписаться — 1 клик в любом письме.</i>\n\n"
             "💡 Например: <code>name@company.kz</code>"
         )
+        try:
+            from src.bot.utils.ab_testing import ab_get_text
+            email_text = await ab_get_text("email_prompt", user_id, default=default_email_text)
+        except Exception:
+            email_text = default_email_text
+
+        await callback.message.answer(email_text)
         await state.set_state(LeadForm.waiting_for_email)
         return
 
@@ -857,6 +866,14 @@ async def process_guide_download(
         metrics.inc("pdf_delivered")
         asyncio.create_task(track(user_id, "pdf_delivered", guide_id=guide_id, source=_src or None))
         pdf_sent = True
+
+    # A/B testing: отметить конверсию
+    if pdf_sent:
+        try:
+            from src.bot.utils.ab_testing import ab_convert
+            asyncio.create_task(ab_convert(user_id, "pdf_delivered"))
+        except Exception:
+            pass
 
     # Retargeting: Facebook Conversions API (fire-and-forget)
     if pdf_sent and existing_lead:
@@ -1203,6 +1220,11 @@ async def process_email(
 
     metrics.inc("email_collected")
     asyncio.create_task(track(message.from_user.id, "email_submitted"))
+    try:
+        from src.bot.utils.ab_testing import ab_convert
+        asyncio.create_task(ab_convert(message.from_user.id, "email_submitted"))
+    except Exception:
+        pass
     await state.update_data(email=email)
     await message.answer(get_text(texts, "email_saved"))
     await state.set_state(LeadForm.waiting_for_name)

@@ -430,7 +430,7 @@ async def cmd_start(
         # ── Новый пользователь — сразу выгода, потом барьеры ─────
         guide_count = len(catalog)
 
-        welcome_text = (
+        default_welcome = (
             "Привет! Я помогу вам разобраться "
             "в юридических вопросах бизнеса в Казахстане.\n\n"
             f"У нас <b>{guide_count} бесплатных PDF-гайдов</b> "
@@ -440,6 +440,15 @@ async def cmd_start(
             "Выберите тему — и получите гайд "
             "прямо сюда, в чат 👇"
         )
+
+        # A/B тест приветствия для новых пользователей
+        try:
+            from src.bot.utils.ab_testing import ab_get_text
+            welcome_text = await ab_get_text(
+                "welcome_cta", message.from_user.id, default=default_welcome,
+            )
+        except Exception:
+            welcome_text = default_welcome
 
         try:
             await message.answer(
