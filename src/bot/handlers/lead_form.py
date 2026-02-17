@@ -384,6 +384,7 @@ async def show_guide_preview(
     guide_title = guide_info.get("title", guide_id)
     guide_desc = guide_info.get("description", "")
     preview = guide_info.get("preview", "") or guide_info.get("preview_text", "")
+    highlights = guide_info.get("highlights", "")
     pages = str(guide_info.get("pages", "")).strip()
     category = guide_info.get("category", "")
 
@@ -397,24 +398,29 @@ async def show_guide_preview(
     dl_count = await count_guide_downloads(guide_id)
 
     # ── Формируем карточку ────────────────────────────────────────────
-    card_parts = [f"🔹 <b>{_esc_html(guide_title)}</b>"]
+    card_parts = [f"📚 <b>{_esc_html(guide_title)}</b>"]
 
     if guide_desc:
         card_parts.append(f"\n{_esc_html(guide_desc)}")
 
-    # Метаданные: категория, объём
+    # Метаданные: категория, объём, формат
     meta_items = []
     if category:
         meta_items.append(_esc_html(category))
     if pages:
         meta_items.append(f"{_esc_html(pages)} стр.")
-    meta_items.append("PDF")
+    meta_items.append("PDF · бесплатно")
     if meta_items:
         card_parts.append("\n" + "  ·  ".join(meta_items))
 
-    # Что внутри
-    if preview:
-        card_parts.append(f"\n🔹 <b>Что внутри:</b>\n{_esc_html(preview)}")
+    # Что внутри: сначала highlights (структурированные), затем preview
+    if highlights:
+        items = [h.strip() for h in highlights.replace("\n", ";").split(";") if h.strip()]
+        if items:
+            bullets = "\n".join(f"  ✓ {_esc_html(item)}" for item in items[:6])
+            card_parts.append(f"\n📋 <b>Что внутри:</b>\n{bullets}")
+    elif preview:
+        card_parts.append(f"\n📋 <b>Что внутри:</b>\n{_esc_html(preview)}")
 
     # Freshness / download counter (динамический)
     freshness = _get_freshness_line(guide_info, dl_count)
@@ -1293,6 +1299,43 @@ async def noop_handler(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+def _build_category_snippet(guides: list[dict], page: int = 0, page_size: int = 3) -> str:
+    """Формирует текст с мини-описаниями гайдов на текущей странице."""
+    start = page * page_size
+    end = start + page_size
+    page_items = guides[start:end]
+
+    parts = []
+    for g in page_items:
+        title = g.get("title", "")
+        desc = g.get("description", "")
+        pages = str(g.get("pages", "")).strip()
+        highlights = g.get("highlights", "")
+
+        line = f"📄 <b>{_esc_html(title)}</b>"
+
+        # Краткое описание (первое предложение)
+        if desc:
+            short = desc.split(".")[0].strip()
+            if short:
+                line += f"\n{_esc_html(short)}."
+
+        # Что внутри (highlights — 2-3 пункта)
+        if highlights:
+            items = [h.strip() for h in highlights.replace("\n", ";").split(";") if h.strip()]
+            if items:
+                shown = items[:3]
+                line += "\n" + ", ".join(_esc_html(i) for i in shown)
+
+        # Страницы
+        if pages:
+            line += f"  · {_esc_html(pages)} стр."
+
+        parts.append(line)
+
+    return "\n\n".join(parts)
+
+
 @router.callback_query(F.data.startswith("cat_"))
 async def show_category_guides(
     callback: CallbackQuery,
@@ -1300,7 +1343,7 @@ async def show_category_guides(
     google: GoogleSheetsClient,
     cache: TTLCache,
 ) -> None:
-    """Показывает гайды внутри выбранной категории (с пагинацией)."""
+    """Показывает гайды внутри выбранной категории с мини-описаниями."""
     cat_slug = callback.data.removeprefix("cat_")
     asyncio.create_task(track(callback.from_user.id, "view_category", meta=cat_slug))
 
@@ -1320,10 +1363,14 @@ async def show_category_guides(
     cat_name = filtered[0].get("category", "Гайды")
     await state.update_data(current_category=cat_slug)
 
+    # Мини-описания гайдов на первой странице
+    snippet = _build_category_snippet(filtered, page=0)
+
     prefix = f"cpage_{cat_slug}"
+    header = f"📂 <b>{cat_name}</b>\n\n{snippet}\n\n<i>Нажмите на гайд для подробностей:</i>"
+
     await callback.message.answer(
-        f"📂 <b>{cat_name}</b>\n\nВыберите гайд:\n"
-        f"<i>Листайте кнопками ◀️ / ▶️</i>",
+        header,
         reply_markup=paginated_guides_keyboard(
             filtered, page=0,
             prefix=prefix,
