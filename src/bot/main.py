@@ -94,43 +94,22 @@ async def _job_qa_audit() -> None:
 # Команды для всех пользователей
 USER_COMMANDS = [
     BotCommand(command="start", description="Начать / выбрать гайд"),
-    BotCommand(command="consult", description="AI-юрист — задать вопрос (текст/голос)"),
-    BotCommand(command="profile", description="Личный кабинет и карма"),
-    BotCommand(command="review", description="AI DocReview — анализ договоров"),
-    BotCommand(command="brainstorm", description="Консилиум 3-х AI-юристов"),
-    BotCommand(command="doc", description="Генератор юридических документов"),
-    BotCommand(command="bin", description="Проверка контрагента по БИН"),
-    BotCommand(command="remind", description="Напоминание о дедлайне"),
+    BotCommand(command="consult", description="Задать вопрос юристу"),
     BotCommand(command="booking", description="Запись на консультацию"),
-    BotCommand(command="docgen", description="Генератор документов (.docx)"),
-    BotCommand(command="mytasks", description="Мои задачи"),
-    BotCommand(command="referral", description="Реферальная программа"),
-    BotCommand(command="lang", description="Выбор языка / Тіл / Language"),
-    BotCommand(command="timezone", description="Часовой пояс"),
+    BotCommand(command="profile", description="Личный кабинет"),
 ]
 
 # Команды для администратора
 ADMIN_COMMANDS = [
     BotCommand(command="start", description="Начать / выбрать гайд"),
+    BotCommand(command="test_flow", description="Сброс — тест как новый"),
     BotCommand(command="admin", description="Панель управления"),
-    BotCommand(command="publish", description="Опубликовать статью"),
-    BotCommand(command="chat", description="Чат с AI-стратегом"),
-    BotCommand(command="consult", description="AI-юрист — задать вопрос"),
     BotCommand(command="broadcast", description="Рассылка (#сегмент)"),
-    BotCommand(command="reply", description="Ответить пользователю"),
-    BotCommand(command="doc", description="Генератор документов"),
-    BotCommand(command="profile", description="Личный кабинет"),
-    BotCommand(command="referral", description="Реферальная программа"),
-    BotCommand(command="lang", description="Выбор языка"),
-    BotCommand(command="timezone", description="Часовой пояс"),
-    BotCommand(command="waitlist", description="Coming Soon услуги"),
     BotCommand(command="report", description="Dashboard 24ч"),
-    BotCommand(command="growth", description="Growth-отчёт"),
-    BotCommand(command="tasks", description="Тикеты / задачи"),
-    BotCommand(command="funnel", description="Воронка продаж"),
-    BotCommand(command="audit", description="Аудит безопасности"),
-    BotCommand(command="errors", description="Статистика ошибок"),
     BotCommand(command="refresh", description="Сброс кеша"),
+    BotCommand(command="consult", description="Задать вопрос юристу"),
+    BotCommand(command="booking", description="Запись на консультацию"),
+    BotCommand(command="profile", description="Личный кабинет"),
 ]
 
 
