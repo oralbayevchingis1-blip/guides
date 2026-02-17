@@ -447,6 +447,22 @@ async def cmd_sources(message: Message) -> None:
         await message.answer(f"❌ Ошибка: {e}")
 
 
+# Рекомендации при обнаружении узкого места
+_BOTTLENECK_RECS: dict[str, str] = {
+    "view_categories": "Мало кто доходит до категорий. Попробуйте: более короткое приветствие, кнопки категорий сразу в /start.",
+    "view_category": "Пользователи не выбирают категорию. Проверьте: понятны ли названия? Добавьте описания.",
+    "view_guide": "Падение на карточке гайда. Улучшите описание гайдов: добавьте highlights, соц.доказательство.",
+    "click_download": "Мало кликов «Скачать». Усильте CTA: добавьте urgency, счётчик скачиваний, больше social proof.",
+    "sub_prompt": "Барьер подписки отсекает пользователей. Объясните ценность канала ДО запроса подписки.",
+    "sub_confirmed": "Пользователи не подписываются. Сделайте канал ценнее или упростите шаг (не обязательный?).",
+    "email_prompt": "Падение на запросе email. Объясните зачем нужен email (ссылка на гайд, уведомления).",
+    "email_submitted": "Пользователи не вводят email. Упростите текст, гарантируйте отсутствие спама.",
+    "consent_given": "Согласие не дают. Упростите формулировку, покажите что данные защищены.",
+    "pdf_delivered": "PDF не доставлен. Проверьте: файл загружен? Google Drive доступен? Нет ошибок?",
+    "consultation": "Мало записей на консультацию. Усильте предложение: дефицит слотов, бесплатность, social proof.",
+}
+
+
 FUNNEL_LABELS = {
     "bot_start": "▶ Старт бота",
     "view_categories": "📂 Категории",
@@ -545,9 +561,37 @@ async def cmd_funnel(message: Message) -> None:
             label = FUNNEL_LABELS.get(worst_step, worst_step)
             lines.append(f"\n🔻 <b>Узкое место:</b> {label} ({worst_rate:.0f}%)")
 
+            # Рекомендации по узкому месту
+            rec = _BOTTLENECK_RECS.get(worst_step, "")
+            if rec:
+                lines.append(f"💡 <i>{rec}</i>")
+
+        # ── Тренд vs предыдущий период ──
+        try:
+            from src.database.crud import get_funnel_trends
+            trends = await get_funnel_trends(current_hours=hours)
+            key_steps = ["bot_start", "pdf_delivered", "consultation"]
+            trend_parts = []
+            for s in key_steps:
+                t = trends.get(s, {})
+                cur = t.get("current", 0)
+                prev = t.get("previous", 0)
+                change = t.get("change_pct", 0)
+                if prev > 0 or cur > 0:
+                    arrow = "📈" if change > 0 else ("📉" if change < 0 else "➡️")
+                    label = FUNNEL_LABELS.get(s, s)
+                    trend_parts.append(f"  {arrow} {label}: {prev}→{cur} ({change:+.0f}%)")
+            if trend_parts:
+                lines.append(f"\n📊 <b>Тренд vs пред. период:</b>")
+                lines.extend(trend_parts)
+        except Exception:
+            pass
+
         lines.append(
             f"\n💡 <code>/funnel 7d</code> — за неделю\n"
-            f"<code>/funnel 30d src</code> — за месяц + разбивка по источникам"
+            f"<code>/funnel 30d src</code> — за месяц + разбивка\n"
+            f"<code>/funnel_guides</code> — воронка по гайдам\n"
+            f"<code>/funnel_export</code> — выгрузка в Sheets"
         )
 
         await message.answer("\n".join(lines))
@@ -580,6 +624,197 @@ def _format_period(hours: int) -> str:
     if days == 1:
         return "24ч"
     return f"{days}д"
+
+
+@router.message(Command("funnel_guides"))
+async def cmd_funnel_guides(
+    message: Message,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Воронка в разрезе гайдов: конверсия от просмотра до скачивания.
+
+    Использование:
+        /funnel_guides        — за 7 дней
+        /funnel_guides 30d    — за 30 дней
+    """
+    if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
+        return
+
+    args = (message.text or "").split()[1:]
+    hours = 168  # 7 дней по умолчанию
+    for arg in args:
+        arg_lower = arg.lower()
+        if arg_lower.endswith("d") and arg_lower[:-1].isdigit():
+            hours = int(arg_lower[:-1]) * 24
+        elif arg_lower.endswith("h") and arg_lower[:-1].isdigit():
+            hours = int(arg_lower[:-1])
+
+    try:
+        from src.database.crud import get_funnel_by_guide
+        guide_stats = await get_funnel_by_guide(hours=hours)
+
+        if not guide_stats:
+            await message.answer(
+                f"📊 Нет данных по гайдам за {_format_period(hours)}."
+            )
+            return
+
+        # Загружаем каталог для названий
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        title_map = {str(g.get("id", "")): g.get("title", "")[:25] for g in catalog}
+
+        period = _format_period(hours)
+        lines = [f"📚 <b>Воронка по гайдам ({period})</b>\n"]
+
+        # Заголовок таблицы
+        lines.append("<code>Гайд                 👁  📥  📄  CVR</code>")
+        lines.append("<code>" + "─" * 42 + "</code>")
+
+        for g in guide_stats[:15]:
+            gid = g["guide_id"]
+            title = title_map.get(gid, gid)[:20]
+            views = g["views"]
+            clicks = g["clicks"]
+            pdfs = g["pdfs"]
+            cvr = g["conversion"]
+
+            # Цветовая маркировка конверсии
+            if cvr >= 30:
+                cvr_str = f"🟢{cvr:.0f}%"
+            elif cvr >= 15:
+                cvr_str = f"🟡{cvr:.0f}%"
+            else:
+                cvr_str = f"🔴{cvr:.0f}%"
+
+            lines.append(
+                f"<code>{title:20s}</code> "
+                f"{views:3d}  {clicks:3d}  {pdfs:3d}  {cvr_str}"
+            )
+
+        # Лучший и худший
+        if len(guide_stats) >= 2:
+            sorted_by_cvr = sorted(
+                [g for g in guide_stats if g["views"] >= 3],
+                key=lambda x: -x["conversion"],
+            )
+            if sorted_by_cvr:
+                best = sorted_by_cvr[0]
+                worst = sorted_by_cvr[-1]
+                best_title = title_map.get(best["guide_id"], best["guide_id"])[:20]
+                worst_title = title_map.get(worst["guide_id"], worst["guide_id"])[:20]
+                lines.append(
+                    f"\n🏆 <b>Лучший:</b> {best_title} ({best['conversion']:.0f}%)\n"
+                    f"⚠️ <b>Худший:</b> {worst_title} ({worst['conversion']:.0f}%)"
+                )
+
+        # Средняя конверсия
+        with_views = [g for g in guide_stats if g["views"] > 0]
+        if with_views:
+            avg_cvr = sum(g["conversion"] for g in with_views) / len(with_views)
+            lines.append(f"\n📊 Средняя конверсия просмотр→PDF: <b>{avg_cvr:.1f}%</b>")
+
+        # Подписка — узкое место?
+        total_sub_shown = sum(g["sub_prompts"] for g in guide_stats)
+        total_sub_ok = sum(g["sub_confirmed"] for g in guide_stats)
+        if total_sub_shown > 0:
+            sub_rate = total_sub_ok / total_sub_shown * 100
+            lines.append(f"🔔 Конверсия подписки: {total_sub_ok}/{total_sub_shown} (<b>{sub_rate:.0f}%</b>)")
+
+        lines.append(f"\n💡 <code>/funnel_guides 30d</code> — за месяц")
+
+        await message.answer("\n".join(lines))
+
+    except Exception as e:
+        logger.error("Funnel guides error: %s", e, exc_info=True)
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+@router.message(Command("funnel_export"))
+async def cmd_funnel_export(
+    message: Message,
+    google: GoogleSheetsClient,
+    cache: TTLCache,
+) -> None:
+    """Выгружает данные воронки в Google Sheets (лист «Funnel Analytics»).
+
+    /funnel_export        — за 7 дней
+    /funnel_export 30d    — за 30 дней
+    """
+    if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
+        return
+
+    args = (message.text or "").split()[1:]
+    hours = 168
+    for arg in args:
+        arg_lower = arg.lower()
+        if arg_lower.endswith("d") and arg_lower[:-1].isdigit():
+            hours = int(arg_lower[:-1]) * 24
+
+    await message.answer("⏳ Выгружаю данные воронки в Google Sheets...")
+
+    try:
+        from datetime import datetime, timezone as tz
+        from src.database.crud import get_funnel_by_guide, get_funnel_by_source
+
+        # 1. Общая воронка
+        stats = await get_funnel_stats(hours=hours)
+
+        # 2. По гайдам
+        guide_stats = await get_funnel_by_guide(hours=hours)
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        title_map = {str(g.get("id", "")): g.get("title", "") for g in catalog}
+
+        # 3. По источникам
+        source_stats = await get_funnel_by_source(hours=hours)
+
+        now = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M")
+        period = _format_period(hours)
+
+        # Строим строки для Sheets
+        rows = [
+            [f"Funnel Export — {period} — {now}"],
+            [],
+            ["Шаг воронки", "Уник. пользователей", "Всего событий", "Конверсия"],
+        ]
+
+        prev_u = None
+        for step, users, events in stats:
+            label = FUNNEL_LABELS.get(step, step)
+            conv = f"{users/prev_u*100:.1f}%" if prev_u and prev_u > 0 else "—"
+            rows.append([label, str(users), str(events), conv])
+            prev_u = users
+
+        rows.extend([[], ["По гайдам"], ["Гайд", "Название", "Просмотры", "Клики", "PDF", "Конверсия"]])
+        for g in guide_stats:
+            title = title_map.get(g["guide_id"], "")
+            rows.append([
+                g["guide_id"], title, str(g["views"]),
+                str(g["clicks"]), str(g["pdfs"]), f"{g['conversion']:.1f}%",
+            ])
+
+        rows.extend([[], ["По источникам"], ["Источник", "Старты", "PDF", "Конверсия"]])
+        for source, steps in sorted(source_stats.items(), key=lambda x: -sum(x[1].values())):
+            starts = steps.get("bot_start", 0)
+            pdfs = steps.get("pdf_delivered", 0)
+            conv = f"{pdfs/starts*100:.1f}%" if starts > 0 else "—"
+            rows.append([source, str(starts), str(pdfs), conv])
+
+        # Записываем в Sheets
+        await google.export_funnel_data(rows)
+
+        await message.answer(
+            f"✅ <b>Воронка выгружена в Google Sheets!</b>\n\n"
+            f"📊 Период: {period}\n"
+            f"📋 Шагов воронки: {len(stats)}\n"
+            f"📚 Гайдов: {len(guide_stats)}\n"
+            f"📱 Источников: {len(source_stats)}\n\n"
+            f"Лист: «Funnel Analytics»"
+        )
+
+    except Exception as e:
+        logger.error("Funnel export error: %s", e, exc_info=True)
+        await message.answer(f"❌ Ошибка экспорта: {e}")
 
 
 @router.message(Command("promo"))

@@ -371,7 +371,9 @@ async def show_guide_preview(
 ) -> None:
     """Показывает карточку-превью гайда: название, описание, 'что внутри'."""
     guide_id = callback.data.removeprefix("guide_")
-    asyncio.create_task(track(callback.from_user.id, "view_guide", guide_id=guide_id))
+    fsm = await state.get_data()
+    _src = fsm.get("traffic_source", "")
+    asyncio.create_task(track(callback.from_user.id, "view_guide", guide_id=guide_id, source=_src or None))
 
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
     texts = await cache.get_or_fetch("texts", google.get_bot_texts)
@@ -1471,11 +1473,14 @@ async def process_decline(
 @router.callback_query(F.data == "show_categories")
 async def show_categories(
     callback: CallbackQuery,
+    state: FSMContext,
     google: GoogleSheetsClient,
     cache: TTLCache,
 ) -> None:
     """Показывает список категорий."""
-    asyncio.create_task(track(callback.from_user.id, "view_categories"))
+    fsm = await state.get_data()
+    _src = fsm.get("traffic_source", "")
+    asyncio.create_task(track(callback.from_user.id, "view_categories", source=_src or None))
 
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
     if not catalog:
@@ -1604,7 +1609,9 @@ async def show_category_guides(
 ) -> None:
     """Показывает гайды внутри выбранной категории с мини-описаниями."""
     cat_slug = callback.data.removeprefix("cat_")
-    asyncio.create_task(track(callback.from_user.id, "view_category", meta=cat_slug))
+    fsm = await state.get_data()
+    _src = fsm.get("traffic_source", "")
+    asyncio.create_task(track(callback.from_user.id, "view_category", meta=cat_slug, source=_src or None))
 
     catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
 

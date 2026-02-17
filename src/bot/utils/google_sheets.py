@@ -1478,3 +1478,32 @@ class GoogleSheetsClient:
         status = "OK" if failed == 0 else f"PARTIAL ({failed} errors)"
         row = [now, campaign_id, segment, guide_id, str(total), str(sent), str(failed), status]
         await asyncio.to_thread(self._sync_log_email_campaign, row)
+
+    # ── Экспорт воронки в Sheets ────────────────────────────────────────
+
+    @retry_sheets()
+    def _sync_export_funnel(self, rows: list[list[str]]) -> None:
+        """Записывает данные воронки в лист «Funnel Analytics»."""
+        try:
+            spreadsheet = self._get_spreadsheet()
+            try:
+                ws = spreadsheet.worksheet("Funnel Analytics")
+                ws.clear()
+            except Exception:
+                ws = spreadsheet.add_worksheet(
+                    title="Funnel Analytics", rows=200, cols=10,
+                )
+            if rows:
+                ws.update(
+                    range_name=f"A1:J{len(rows)}",
+                    values=rows,
+                    value_input_option="USER_ENTERED",
+                )
+            logger.info("Funnel data exported to Sheets (%d rows)", len(rows))
+        except Exception as e:
+            logger.error("Funnel export error: %s", e)
+            raise
+
+    async def export_funnel_data(self, rows: list[list[str]]) -> None:
+        """Выгружает данные воронки в Google Sheets (async)."""
+        await asyncio.to_thread(self._sync_export_funnel, rows)

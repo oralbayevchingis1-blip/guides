@@ -800,6 +800,128 @@ async def get_funnel_stats(
     return rows
 
 
+async def get_funnel_by_guide(hours: int = 168) -> list[dict]:
+    """Воронка в разрезе гайдов: от просмотра до скачивания.
+
+    Returns:
+        [{guide_id, views, clicks, pdfs, conversion}] — отсортировано по views desc.
+    """
+    from datetime import timedelta
+
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    async with async_session() as session:
+        from sqlalchemy import case as sa_case
+
+        stmt = (
+            select(
+                FunnelEvent.guide_id,
+                sa_func.count(FunnelEvent.user_id.distinct()).label("total_users"),
+                sa_func.sum(sa_case(
+                    (FunnelEvent.step == "view_guide", 1), else_=0,
+                )).label("views"),
+                sa_func.sum(sa_case(
+                    (FunnelEvent.step == "click_download", 1), else_=0,
+                )).label("clicks"),
+                sa_func.sum(sa_case(
+                    (FunnelEvent.step == "pdf_delivered", 1), else_=0,
+                )).label("pdfs"),
+                sa_func.sum(sa_case(
+                    (FunnelEvent.step == "sub_prompt", 1), else_=0,
+                )).label("sub_prompts"),
+                sa_func.sum(sa_case(
+                    (FunnelEvent.step == "sub_confirmed", 1), else_=0,
+                )).label("sub_confirmed"),
+            )
+            .where(
+                FunnelEvent.created_at >= since,
+                FunnelEvent.guide_id.isnot(None),
+                FunnelEvent.guide_id != "",
+            )
+            .group_by(FunnelEvent.guide_id)
+            .order_by(sa_func.sum(sa_case(
+                (FunnelEvent.step == "view_guide", 1), else_=0,
+            )).desc())
+        )
+        result = await session.execute(stmt)
+
+    rows = []
+    for r in result.all():
+        views = r.views or 0
+        clicks = r.clicks or 0
+        pdfs = r.pdfs or 0
+        conv = (pdfs / views * 100) if views > 0 else 0
+        click_rate = (clicks / views * 100) if views > 0 else 0
+        rows.append({
+            "guide_id": r.guide_id,
+            "views": views,
+            "clicks": clicks,
+            "pdfs": pdfs,
+            "sub_prompts": r.sub_prompts or 0,
+            "sub_confirmed": r.sub_confirmed or 0,
+            "click_rate": round(click_rate, 1),
+            "conversion": round(conv, 1),
+        })
+    return rows
+
+
+async def get_funnel_trends(current_hours: int = 168) -> dict:
+    """Сравнение воронки за текущий период vs предыдущий.
+
+    Returns:
+        {step: {current: N, previous: N, change_pct: float}}
+    """
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    current_since = now - timedelta(hours=current_hours)
+    previous_since = current_since - timedelta(hours=current_hours)
+
+    async def _period_stats(since: datetime, until: datetime) -> dict[str, int]:
+        async with async_session() as session:
+            stmt = (
+                select(
+                    FunnelEvent.step,
+                    sa_func.count(FunnelEvent.user_id.distinct()),
+                )
+                .where(
+                    FunnelEvent.created_at >= since,
+                    FunnelEvent.created_at < until,
+                )
+                .group_by(FunnelEvent.step)
+            )
+            result = await session.execute(stmt)
+            return {row[0]: row[1] for row in result.all()}
+
+    current = await _period_stats(current_since, now)
+    previous = await _period_stats(previous_since, current_since)
+
+    funnel_order = [
+        "bot_start", "view_categories", "view_category", "view_guide",
+        "click_download", "sub_prompt", "sub_confirmed",
+        "email_prompt", "email_submitted", "consent_given",
+        "pdf_delivered", "consultation",
+    ]
+
+    trends: dict[str, dict] = {}
+    for step in funnel_order:
+        cur = current.get(step, 0)
+        prev = previous.get(step, 0)
+        if prev > 0:
+            change = ((cur - prev) / prev) * 100
+        elif cur > 0:
+            change = 100.0
+        else:
+            change = 0.0
+        trends[step] = {
+            "current": cur,
+            "previous": prev,
+            "change_pct": round(change, 1),
+        }
+
+    return trends
+
+
 async def get_codownload_matrix(min_shared: int = 2) -> dict[str, list[tuple[str, int]]]:
     """Коллаборативная фильтрация: «часто скачивают вместе».
 
