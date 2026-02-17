@@ -21,6 +21,20 @@ from src.database.crud import (
 
 logger = logging.getLogger(__name__)
 
+# ─────────────── APScheduler compat (used by Railway main.py) ──────────────
+
+_scheduler_instance = None
+
+
+def get_scheduler():
+    """Return a shared AsyncIOScheduler instance (backward-compat)."""
+    global _scheduler_instance
+    if _scheduler_instance is None:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        _scheduler_instance = AsyncIOScheduler(timezone="UTC")
+    return _scheduler_instance
+
+
 # Тип обработчика: async (task_dto) -> None
 TaskHandler = Callable[..., Coroutine[Any, Any, None]]
 

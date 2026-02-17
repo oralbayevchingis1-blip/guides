@@ -911,3 +911,25 @@ async def get_funnel_by_source(hours: int = 168) -> dict[str, dict[str, int]]:
         data[source][step] = users
 
     return dict(data)
+
+
+# ──────────────────── Backward-compat stubs ──────────────────────────────
+
+
+async def count_referrals(user_id: int) -> int:
+    """Count referrals for a user (stub — referral table not yet created)."""
+    return 0
+
+
+async def get_leads_by_user(user_id: int) -> list:
+    """Get leads by user_id."""
+    async with async_session() as session:
+        stmt = select(Lead).where(Lead.user_id == user_id)
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+
+async def save_referral(referrer_id: int, referred_id: int) -> bool:
+    """Save a referral relationship (stub)."""
+    logger.info("Referral: %s -> %s (stub)", referrer_id, referred_id)
+    return True
