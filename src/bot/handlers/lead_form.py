@@ -495,9 +495,11 @@ async def _build_whats_next(
     next_gid = ""
     next_article = ""
 
-    # 1. Коллаборативная фильтрация
+    # 1. Персонализированная коллаборативная фильтрация (сфера + давность)
     if guide_id:
-        next_gid = await smart_recommender.get_recommendation(guide_id, exclude=exclude)
+        next_gid = await smart_recommender.get_personalized_recommendation(
+            guide_id, user_id, exclude=exclude, user_sphere=sphere,
+        )
         next_guide = _find_guide(catalog, next_gid) if next_gid else None
         if next_guide:
             rec_source = "collab"

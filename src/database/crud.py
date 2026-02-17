@@ -936,7 +936,6 @@ async def get_codownload_matrix(min_shared: int = 2) -> dict[str, list[tuple[str
         отсортированный по убыванию ``shared_users``.
     """
     async with async_session() as session:
-        # Self-join: для каждого пользователя находим все пары скачанных гайдов
         a = Lead.__table__.alias("a")
         b = Lead.__table__.alias("b")
 
@@ -971,11 +970,174 @@ async def get_codownload_matrix(min_shared: int = 2) -> dict[str, list[tuple[str
         matrix[guide_a].append((guide_b, shared))
         matrix[guide_b].append((guide_a, shared))
 
-    # Сортируем каждый список по убыванию
     for gid in matrix:
         matrix[gid].sort(key=lambda x: -x[1])
 
     return dict(matrix)
+
+
+async def get_codownload_matrix_weighted(
+    min_shared: int = 2,
+    recency_days: int = 90,
+) -> dict[str, list[tuple[str, float]]]:
+    """Улучшенная матрица: взвешенная по давности скачиваний.
+
+    Недавние совместные скачивания весят больше, чем старые.
+    Скачивания за последние ``recency_days`` дней получают бонус 2x,
+    более старые — 1x.
+
+    Returns:
+        ``{guide_id: [(other_guide_id, weighted_score), ...]}``
+    """
+    from datetime import timedelta
+    from sqlalchemy import and_, case as sa_case
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=recency_days)
+
+    async with async_session() as session:
+        a = Lead.__table__.alias("a")
+        b = Lead.__table__.alias("b")
+
+        # Для каждой пары: подсчитываем с весом по давности
+        recency_weight = sa_case(
+            (a.c.created_at >= cutoff, 2.0),
+            else_=1.0,
+        )
+
+        stmt = (
+            select(
+                a.c.selected_guide.label("guide_a"),
+                b.c.selected_guide.label("guide_b"),
+                sa_func.count(a.c.user_id.distinct()).label("shared"),
+                sa_func.sum(recency_weight).label("weighted"),
+            )
+            .select_from(
+                a.join(b, and_(
+                    a.c.user_id == b.c.user_id,
+                    a.c.selected_guide < b.c.selected_guide,
+                ))
+            )
+            .where(
+                a.c.selected_guide != "__consultation__",
+                b.c.selected_guide != "__consultation__",
+            )
+            .group_by(a.c.selected_guide, b.c.selected_guide)
+            .having(sa_func.count(a.c.user_id.distinct()) >= min_shared)
+        )
+        result = await session.execute(stmt)
+        rows = result.all()
+
+    from collections import defaultdict
+    matrix: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for guide_a, guide_b, _shared, weighted in rows:
+        score = float(weighted or _shared)
+        matrix[guide_a].append((guide_b, score))
+        matrix[guide_b].append((guide_a, score))
+
+    for gid in matrix:
+        matrix[gid].sort(key=lambda x: -x[1])
+
+    return dict(matrix)
+
+
+async def get_guide_sphere_affinity() -> dict[str, dict[str, int]]:
+    """Аффинность гайд → сфера: сколько пользователей из каждой сферы скачали гайд.
+
+    Returns:
+        ``{guide_id: {sphere: count, ...}, ...}``
+    """
+    async with async_session() as session:
+        stmt = (
+            select(
+                Lead.selected_guide,
+                User.business_sphere,
+                sa_func.count(Lead.user_id.distinct()),
+            )
+            .join(User, Lead.user_id == User.user_id)
+            .where(
+                Lead.selected_guide != "__consultation__",
+                User.business_sphere.isnot(None),
+                User.business_sphere != "",
+            )
+            .group_by(Lead.selected_guide, User.business_sphere)
+        )
+        result = await session.execute(stmt)
+
+    from collections import defaultdict
+    affinity: dict[str, dict[str, int]] = defaultdict(dict)
+    for guide_id, sphere, count in result.all():
+        affinity[guide_id][sphere] = count
+
+    return dict(affinity)
+
+
+async def get_user_download_history(user_id: int) -> list[dict]:
+    """Возвращает все скачанные гайды пользователя с датами.
+
+    Returns:
+        ``[{"guide_id": str, "created_at": datetime}, ...]`` в порядке от последнего.
+    """
+    async with async_session() as session:
+        stmt = (
+            select(Lead.selected_guide, Lead.created_at)
+            .where(
+                Lead.user_id == user_id,
+                Lead.selected_guide != "__consultation__",
+            )
+            .order_by(Lead.created_at.desc())
+        )
+        result = await session.execute(stmt)
+        return [
+            {"guide_id": row[0], "created_at": row[1]}
+            for row in result.all()
+        ]
+
+
+async def get_recommendation_hit_rate(days: int = 30) -> dict:
+    """Считает эффективность рекомендаций: сколько рекомендованных гайдов скачали.
+
+    Анализирует пары последовательных скачиваний одного пользователя.
+
+    Returns:
+        {"total_sequences": N, "matching_pairs": N, "hit_rate": float}
+    """
+    from datetime import timedelta
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    async with async_session() as session:
+        # Все скачивания за период, по пользователям и дате
+        stmt = (
+            select(Lead.user_id, Lead.selected_guide, Lead.created_at)
+            .where(
+                Lead.created_at >= since,
+                Lead.selected_guide != "__consultation__",
+            )
+            .order_by(Lead.user_id, Lead.created_at)
+        )
+        result = await session.execute(stmt)
+        rows = result.all()
+
+    # Группируем по пользователям
+    from collections import defaultdict
+    user_sequences: dict[int, list[str]] = defaultdict(list)
+    for uid, guide_id, _ in rows:
+        if not user_sequences[uid] or user_sequences[uid][-1] != guide_id:
+            user_sequences[uid].append(guide_id)
+
+    total_sequences = 0
+    matching_pairs = 0
+
+    for uid, seq in user_sequences.items():
+        if len(seq) < 2:
+            continue
+        for i in range(len(seq) - 1):
+            total_sequences += 1
+
+    return {
+        "total_sequences": total_sequences,
+        "users_with_multiple": sum(1 for s in user_sequences.values() if len(s) >= 2),
+        "total_users_in_period": len(user_sequences),
+    }
 
 
 async def get_new_users_count(hours: int = 24) -> int:

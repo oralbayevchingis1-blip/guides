@@ -1428,19 +1428,28 @@ async def cmd_recommendations(
     cache: TTLCache,
     google: GoogleSheetsClient,
 ) -> None:
-    """Умные рекомендации: top co-download пар + сравнение с Sheets.
+    """Умные рекомендации: top co-download пар + качество + сферы.
 
-    /recommendations         — топ пар «часто скачивают вместе»
+    /recommendations         — полный отчёт
     /recommendations sync    — обновить лист «Рекомендации» в Sheets
+    /recommendations spheres — отчёт по сферам
     """
     if message.from_user is None or message.from_user.id != settings.ADMIN_ID:
         return
 
     args = (message.text or "").split()[1:]
-    do_sync = "sync" in [a.lower() for a in args]
+    lower_args = [a.lower() for a in args]
+    do_sync = "sync" in lower_args
+    do_spheres = "spheres" in lower_args
 
     try:
-        top_pairs = await smart_recommender.get_top_pairs(limit=15)
+        # Сфера-отчёт
+        if do_spheres:
+            await _show_sphere_report(message, cache, google)
+            return
+
+        top_pairs = await smart_recommender.get_top_pairs(limit=12)
+        top_weighted = await smart_recommender.get_top_weighted_pairs(limit=12)
 
         if not top_pairs:
             await message.answer(
@@ -1455,13 +1464,32 @@ async def cmd_recommendations(
             gid = str(g.get("id", ""))
             titles[gid] = g.get("title", gid)[:30]
 
-        lines = ["🧠 <b>Умные рекомендации — «часто скачивают вместе»</b>\n"]
-        for a, b, shared in top_pairs:
-            t_a = titles.get(a, a)[:25]
-            t_b = titles.get(b, b)[:25]
+        # ── 1. Статистика движка ──────────────────────────────────
+        stats = smart_recommender.get_stats()
+        lines = [
+            "🧠 <b>Умные рекомендации</b>\n",
+            f"📊 <b>Движок:</b> матрица {stats['matrix_size']} гайдов, "
+            f"сферы {stats['sphere_guides']} гайдов",
+            f"📈 <b>Hit rate:</b> {stats['hit_rate']}% "
+            f"({stats['hits']}/{stats['requests']} запросов)",
+            f"🎯 Персонализированных: {stats['personalized_requests']}",
+        ]
+
+        # ── 2. Топ пар по весу (свежие скачивания) ─────────────────
+        lines.append("\n<b>🔝 Топ пар (с весом давности):</b>")
+        for a, b, score in top_weighted[:8]:
+            t_a = titles.get(a, a)[:22]
+            t_b = titles.get(b, b)[:22]
+            lines.append(f"  {t_a} ↔ {t_b}  <b>{score:.0f}</b>")
+
+        # ── 3. Топ пар по абсолютному числу ────────────────────────
+        lines.append("\n<b>👥 Топ пар (всего людей):</b>")
+        for a, b, shared in top_pairs[:8]:
+            t_a = titles.get(a, a)[:22]
+            t_b = titles.get(b, b)[:22]
             lines.append(f"  {t_a} ↔ {t_b}  <b>{shared}</b> чел.")
 
-        # Сравнение с Sheets
+        # ── 4. Сравнение с Sheets ──────────────────────────────────
         recommendations = await cache.get_or_fetch("recommendations", google.get_recommendations)
         lines.append(f"\n📋 <b>Маппинг в Sheets:</b> {len(recommendations)} записей")
 
@@ -1471,15 +1499,36 @@ async def cmd_recommendations(
             sheet_rec = recommendations.get(gid, {}).get("next_guide_id", "")
             if smart_rec and sheet_rec and smart_rec != sheet_rec:
                 mismatches += 1
-                lines.append(
-                    f"  ⚡ {titles.get(gid, gid)[:20]}: "
-                    f"Smart→<code>{smart_rec}</code> vs Sheet→<code>{sheet_rec}</code>"
-                )
+                if mismatches <= 5:
+                    lines.append(
+                        f"  ⚡ {titles.get(gid, gid)[:20]}: "
+                        f"Smart→<code>{smart_rec}</code> vs Sheet→<code>{sheet_rec}</code>"
+                    )
 
-        if not mismatches:
+        if mismatches > 5:
+            lines.append(f"  ... и ещё {mismatches - 5} расхождений")
+        elif not mismatches:
             lines.append("  ✅ Совпадения или нет конфликтов")
 
-        lines.append("\n<code>/recommendations sync</code> — обновить Sheets")
+        # ── 5. Качество рекомендаций ─────────────────────────
+        try:
+            from src.database.crud import get_recommendation_hit_rate
+            hr = await get_recommendation_hit_rate(days=30)
+            lines.append(
+                f"\n🎯 <b>Активность:</b> {hr['users_with_multiple']}/"
+                f"{hr['total_users_in_period']} пользователей "
+                f"скачали 2+ гайда (за 30 дней)"
+            )
+            lines.append(
+                f"  Последовательных пар: {hr['total_sequences']}"
+            )
+        except Exception:
+            pass
+
+        lines.append(
+            "\n<code>/recommendations sync</code> — обновить Sheets"
+            "\n<code>/recommendations spheres</code> — отчёт по сферам"
+        )
         await message.answer("\n".join(lines))
 
         if do_sync:
@@ -1487,6 +1536,42 @@ async def cmd_recommendations(
 
     except Exception as e:
         logger.error("Recommendations error: %s", e, exc_info=True)
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+async def _show_sphere_report(
+    message: Message,
+    cache: TTLCache,
+    google: GoogleSheetsClient,
+) -> None:
+    """Показывает, какие сферы бизнеса скачивают какие гайды."""
+    try:
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        titles: dict[str, str] = {}
+        for g in catalog:
+            gid = str(g.get("id", ""))
+            titles[gid] = g.get("title", gid)[:25]
+
+        sphere_report = await smart_recommender.get_sphere_report()
+
+        if not sphere_report:
+            await message.answer("📊 Нет данных о сферах. Пользователи ещё не указали сферу бизнеса.")
+            return
+
+        lines = ["🏢 <b>Аффинность гайдов по сферам бизнеса</b>\n"]
+
+        for gid, spheres in sorted(sphere_report.items(), key=lambda x: -sum(s[1] for s in x[1]))[:15]:
+            title = titles.get(gid, gid)[:25]
+            sphere_str = ", ".join(f"{s} ({c})" for s, c in spheres[:3])
+            lines.append(f"📄 <b>{html.escape(title)}</b>\n  {sphere_str}")
+
+        lines.append(
+            "\n💡 Эти данные автоматически влияют на персонализированные рекомендации."
+        )
+        await message.answer("\n".join(lines))
+
+    except Exception as e:
+        logger.error("Sphere report error: %s", e, exc_info=True)
         await message.answer(f"❌ Ошибка: {e}")
 
 

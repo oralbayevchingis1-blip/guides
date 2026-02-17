@@ -94,6 +94,50 @@ async def _job_auto_email_retarget() -> None:
     await auto_email_retarget(bot=_bot, google=_google, cache=_cache)
 
 
+async def _job_refresh_recommendations() -> None:
+    """Еженедельное обновление матрицы рекомендаций и синхронизация с Sheets."""
+    from src.bot.utils.smart_recommendations import smart_recommender
+
+    try:
+        smart_recommender.invalidate()
+        top_pairs = await smart_recommender.get_top_pairs(limit=50)
+        if not top_pairs:
+            logger.info("Recommendations refresh: no data yet")
+            return
+
+        catalog = await _cache.get_or_fetch("catalog", _google.get_guides_catalog)
+        guide_ids = [str(g.get("id", "")) for g in catalog if g.get("id")]
+
+        mapping: dict[str, str] = {}
+        for gid in guide_ids:
+            rec = await smart_recommender.get_recommendation(gid, exclude=set())
+            if rec:
+                mapping[gid] = rec
+
+        if mapping:
+            await _google.update_recommendations_sheet(mapping)
+            _cache.invalidate()
+            logger.info(
+                "Recommendations auto-sync: %d mappings written to Sheets",
+                len(mapping),
+            )
+
+        stats = smart_recommender.get_stats()
+        logger.info("Recommendations stats: %s", stats)
+
+        if _bot and settings.ADMIN_ID:
+            await _bot.send_message(
+                settings.ADMIN_ID,
+                f"🧠 <b>Авто-обновление рекомендаций</b>\n\n"
+                f"Матрица: {stats['matrix_size']} гайдов, "
+                f"{len(top_pairs)} пар\n"
+                f"Синхронизировано в Sheets: {len(mapping)} записей\n"
+                f"Сферы: {stats['sphere_guides']} гайдов с данными",
+            )
+    except Exception as e:
+        logger.error("Recommendations auto-refresh failed: %s", e, exc_info=True)
+
+
 # ── Команды бота ────────────────────────────────────────────────────────
 
 # Команды для всех пользователей
@@ -305,6 +349,17 @@ async def main() -> None:
         day_of_week="thu",
         hour=10, minute=0,
         id="weekly_email_retarget",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Обновление матрицы рекомендаций: еженедельно (вторник 06:00 UTC = 12:00 Алматы)
+    scheduler.add_job(
+        _job_refresh_recommendations,
+        trigger="cron",
+        day_of_week="tue",
+        hour=6, minute=0,
+        id="weekly_recommendations_refresh",
         replace_existing=True,
         misfire_grace_time=3600,
     )
