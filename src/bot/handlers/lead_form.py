@@ -13,7 +13,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, Message,
 )
 
-from src.bot.keyboards.inline import after_guide_keyboard, categories_keyboard, consent_keyboard, guides_menu_keyboard, main_menu_keyboard, paginated_guides_keyboard, subscription_keyboard, _slugify_cat
+from src.bot.keyboards.inline import categories_keyboard, consent_keyboard, guides_menu_keyboard, main_menu_keyboard, paginated_guides_keyboard, subscription_keyboard, _slugify_cat
 from src.bot.utils.cache import TTLCache
 from src.bot.utils.compliance import log_consent
 from src.bot.utils.disclaimer import add_disclaimer
@@ -455,6 +455,157 @@ async def show_guide_preview(
     await callback.message.answer(card_text, reply_markup=kb)
 
 
+# ──────────────────────── Reusable «Что дальше» builder ───────────────────
+
+
+async def _build_whats_next(
+    user_id: int,
+    guide_id: str,
+    catalog: list[dict],
+    cache: TTLCache,
+    google: GoogleSheetsClient,
+    *,
+    header: str = "",
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Формирует персонализированное сообщение «Что дальше» и кнопки.
+
+    Возвращает (text, keyboard).  Используется:
+    * сразу после отправки PDF
+    * после ответа на profiling-вопрос
+    * после любого завершения диалога (sphere / profile)
+    """
+    from src.database.crud import get_lead_by_user_id
+
+    lead = await get_lead_by_user_id(user_id)
+    name = lead.name if lead else ""
+    sphere = getattr(lead, "business_sphere", None) or "" if lead else ""
+    has_sphere = bool(sphere)
+
+    downloaded_set = await _get_downloaded_set(user_id)
+    exclude = downloaded_set | {guide_id} if guide_id else downloaded_set
+
+    rec_source = ""
+    next_guide = None
+    next_gid = ""
+    next_article = ""
+
+    # 1. Коллаборативная фильтрация
+    if guide_id:
+        next_gid = await smart_recommender.get_recommendation(guide_id, exclude=exclude)
+        next_guide = _find_guide(catalog, next_gid) if next_gid else None
+        if next_guide:
+            rec_source = "collab"
+
+    # 2. По сфере бизнеса
+    if not next_guide and has_sphere:
+        next_guide = _find_guide_by_sphere(
+            catalog, sphere, exclude_ids=exclude,
+            downloaded=downloaded_set,
+        )
+        if next_guide:
+            next_gid = next_guide.get("id", "")
+            rec_source = "sphere"
+
+    # 3. Статический маппинг из «Рекомендации»
+    if guide_id:
+        recommendations = await cache.get_or_fetch("recommendations", google.get_recommendations)
+        rec = recommendations.get(guide_id, {})
+        next_article = rec.get("next_article_link", "")
+        if not next_guide:
+            sheet_gid = rec.get("next_guide_id", "")
+            next_guide = _find_guide(catalog, sheet_gid) if sheet_gid else None
+            if next_guide:
+                next_gid = sheet_gid
+                rec_source = "sheets"
+
+    # 4. Любой не скачанный
+    if not next_guide:
+        for g in catalog:
+            gid = str(g.get("id", ""))
+            if gid and gid not in exclude:
+                next_guide = g
+                next_gid = gid
+                rec_source = "fallback"
+                break
+
+    # ── Текст ────────────────────────────────────────────────────────
+    if header:
+        parts = [header]
+    elif name:
+        parts = [f"✅ <b>{_esc_html(name)}</b>, гайд у вас — сохраните!"]
+    else:
+        parts = ["✅ Гайд у вас — сохраните!"]
+
+    case_text = _get_case_teaser(sphere)
+    if case_text:
+        parts.append(f"\n💼 {case_text}")
+
+    if next_guide:
+        next_title = next_guide.get("title", next_gid)
+        if rec_source == "sphere" and sphere:
+            parts.append(
+                f"\n📚 <b>Для {_esc_html(sphere)}-бизнеса рекомендуем:</b> "
+                f"«{_esc_html(next_title)}»"
+            )
+        elif has_sphere and sphere:
+            parts.append(
+                f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}» "
+                f"(для сферы «{_esc_html(sphere)}»)"
+            )
+        else:
+            parts.append(
+                f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}»"
+            )
+
+    scarcity = await _get_consult_scarcity_line()
+    if scarcity:
+        parts.append(f"\n{scarcity}")
+
+    text = "\n".join(parts)
+
+    # ── Кнопки ───────────────────────────────────────────────────────
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    if _has_case_for_sphere(sphere):
+        buttons.append([InlineKeyboardButton(
+            text="💼 Да, пришли кейс",
+            callback_data=f"send_case_{_normalize_sphere(sphere)}",
+        )])
+
+    if next_guide:
+        cb = f"guide_{next_gid}"
+        while len(cb.encode("utf-8")) > 64:
+            cb = cb[:-1]
+        buttons.append([InlineKeyboardButton(
+            text=f"📥 {next_guide.get('title', 'Следующий гайд')[:40]}",
+            callback_data=cb,
+        )])
+
+    if next_article:
+        buttons.append([InlineKeyboardButton(
+            text="📰 Читать кейс по теме",
+            url=next_article,
+        )])
+
+    buttons.append([InlineKeyboardButton(
+        text="🔹 Все темы",
+        callback_data="show_categories",
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="🔹 Бесплатная консультация",
+        callback_data="book_consultation",
+    )])
+
+    if user_id:
+        buttons.append([InlineKeyboardButton(
+            text="🔗 Отправить другу",
+            callback_data=f"share_bot_{user_id}",
+        )])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    return text, kb
+
+
 # ──────────────────────── Скачивание гайда (шаг 2) ───────────────────────
 
 
@@ -648,126 +799,12 @@ async def process_guide_download(
             await state.set_state(LeadForm.waiting_for_profile)
             return
 
-        # ── Единое сообщение «Что дальше» ─────────────────────────────
-        sphere = getattr(existing_lead, "business_sphere", None) or ""
-        name = existing_lead.name
-
-        # Подбираем следующий гайд (collab → сфера → Sheets → любой)
-        downloaded_set = await _get_downloaded_set(user_id)
-        exclude = downloaded_set | {guide_id}
-        rec_source = ""
-
-        # 1. Коллаборативная фильтрация: «часто скачивают вместе»
-        next_gid = await smart_recommender.get_recommendation(guide_id, exclude=exclude)
-        next_guide = _find_guide(catalog, next_gid) if next_gid else None
-        if next_guide:
-            rec_source = "collab"
-
-        # 2. По сфере бизнеса (приоритет выше статического маппинга)
-        if not next_guide and has_sphere:
-            next_guide = _find_guide_by_sphere(
-                catalog, existing_lead.business_sphere, exclude_ids=exclude,
-                downloaded=downloaded_set,
-            )
-            if next_guide:
-                next_gid = next_guide.get("id", "")
-                rec_source = "sphere"
-
-        # 3. Статический маппинг из листа «Рекомендации»
-        recommendations = await cache.get_or_fetch("recommendations", google.get_recommendations)
-        rec = recommendations.get(guide_id, {})
-        next_article = rec.get("next_article_link", "")
-        if not next_guide:
-            sheet_gid = rec.get("next_guide_id", "")
-            next_guide = _find_guide(catalog, sheet_gid) if sheet_gid else None
-            if next_guide:
-                next_gid = sheet_gid
-                rec_source = "sheets"
-
-        # 4. Любой не скачанный
-        if not next_guide:
-            for g in catalog:
-                gid = str(g.get("id", ""))
-                if gid and gid not in exclude:
-                    next_guide = g
-                    next_gid = gid
-                    rec_source = "fallback"
-                    break
-
-        # Формируем текст
-        case_text = _get_case_teaser(sphere)
-        parts = [f"✅ <b>{_esc_html(name)}</b>, гайд у вас — сохраните!"]
-        parts.append(f"\n💼 {case_text}")
-
-        if next_guide:
-            next_title = next_guide.get("title", next_gid)
-            if rec_source == "sphere" and sphere:
-                parts.append(
-                    f"\n📚 <b>Для {_esc_html(sphere)}-бизнеса рекомендуем:</b> "
-                    f"«{_esc_html(next_title)}»"
-                )
-            elif has_sphere and sphere:
-                parts.append(
-                    f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}» "
-                    f"(для сферы «{_esc_html(sphere)}»)"
-                )
-            else:
-                parts.append(
-                    f"\n📚 <b>Рекомендуем далее:</b> «{_esc_html(next_title)}»"
-                )
-
-        # Scarcity консультаций
-        scarcity = await _get_consult_scarcity_line()
-        if scarcity:
-            parts.append(f"\n{scarcity}")
-
-        whats_next_text = "\n".join(parts)
-
-        # Формируем кнопки
-        buttons = []
-
-        # Кнопка «Да, пришли кейс» — если есть кейс по сфере
-        if _has_case_for_sphere(sphere):
-            buttons.append([InlineKeyboardButton(
-                text="💼 Да, пришли кейс",
-                callback_data=f"send_case_{_normalize_sphere(sphere)}",
-            )])
-
-        if next_guide:
-            cb = f"guide_{next_gid}"
-            while len(cb.encode("utf-8")) > 64:
-                cb = cb[:-1]
-            buttons.append([InlineKeyboardButton(
-                text=f"📥 {next_guide.get('title', 'Следующий гайд')[:40]}",
-                callback_data=cb,
-            )])
-
-        if next_article:
-            buttons.append([InlineKeyboardButton(
-                text="📰 Читать кейс по теме",
-                url=next_article,
-            )])
-
-        buttons.append([InlineKeyboardButton(
-            text="🔹 Все темы",
-            callback_data="show_categories",
-        )])
-        buttons.append([InlineKeyboardButton(
-            text="🔹 Бесплатная консультация",
-            callback_data="book_consultation",
-        )])
-
-        if user_id:
-            buttons.append([InlineKeyboardButton(
-                text="🔗 Отправить другу",
-                callback_data=f"share_bot_{user_id}",
-            )])
-
+        # ── Единое сообщение «Что дальше» (через reusable helper) ──────
         if pdf_sent:
-            await callback.message.answer(
-                whats_next_text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            wn_text, wn_kb = await _build_whats_next(
+                user_id, guide_id, catalog, cache, google,
             )
+            await callback.message.answer(wn_text, reply_markup=wn_kb)
 
         await state.clear()
         return
@@ -803,6 +840,7 @@ async def process_sphere_button(
     value = callback.data.removeprefix("sphere_")
     data = await state.get_data()
     user_id = data.get("profiling_user_id", callback.from_user.id)
+    last_guide = data.get("selected_guide", "")
 
     await callback.answer()
 
@@ -810,39 +848,19 @@ async def process_sphere_button(
         await callback.message.edit_text(
             "Хорошо, пропускаем. Вы всегда сможете уточнить позже.",
         )
-        await callback.message.answer(
-            "📚 Что дальше?",
-            reply_markup=after_guide_keyboard(user_id),
-        )
     else:
         await _save_sphere(user_id, value, google)
-
-        # Рекомендуем гайд по сфере
-        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
-        downloaded = await _get_downloaded_set(user_id)
-        rec_guide = _find_guide_by_sphere(catalog, value, downloaded=downloaded)
-
-        rec_text = ""
-        kb = after_guide_keyboard(user_id)
-        if rec_guide:
-            rec_title = rec_guide.get("title", "")
-            rec_id = rec_guide.get("id", "")
-            rec_text = f"\n\n💡 Для сферы «{_esc_html(value)}» рекомендуем:\n📚 <b>{_esc_html(rec_title)}</b>"
-            dl_data = f"guide_{rec_id}"
-            while len(dl_data.encode("utf-8")) > 64:
-                dl_data = dl_data[:-1]
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"📥 {rec_title}"[:55], callback_data=dl_data)],
-                [InlineKeyboardButton(text="🔹 Все темы", callback_data="show_categories")],
-                [InlineKeyboardButton(text="🔹 Консультация", callback_data="book_consultation")],
-            ])
-
         await callback.message.edit_text(
             f"Отлично, запомнили: <b>{_esc_html(value)}</b>. "
-            f"Буду подбирать материалы для вашей сферы.{rec_text}",
+            "Буду подбирать материалы для вашей сферы.",
         )
-        await callback.message.answer("👇", reply_markup=kb)
 
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    wn_text, wn_kb = await _build_whats_next(
+        user_id, last_guide, catalog, cache, google,
+        header="📚 <b>Что ещё может быть полезно?</b>",
+    )
+    await callback.message.answer(wn_text, reply_markup=wn_kb)
     await state.clear()
 
 
@@ -862,43 +880,34 @@ async def process_business_sphere(
 
     data = await state.get_data()
     user_id = data.get("profiling_user_id", message.from_user.id)
+    last_guide = data.get("selected_guide", "")
 
     if text == "-" or len(text) < 2:
         await message.answer(
             "Хорошо, пропускаем. Вы всегда сможете уточнить позже.",
-            reply_markup=after_guide_keyboard(user_id),
         )
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        wn_text, wn_kb = await _build_whats_next(
+            user_id, last_guide, catalog, cache, google,
+            header="📚 <b>Что ещё может быть полезно?</b>",
+        )
+        await message.answer(wn_text, reply_markup=wn_kb)
         await state.clear()
         return
 
     sphere = text[:100]
     await _save_sphere(user_id, sphere, google)
 
-    # Рекомендуем гайд по сфере
-    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
-    downloaded = await _get_downloaded_set(user_id)
-    rec_guide = _find_guide_by_sphere(catalog, sphere, downloaded=downloaded)
-
-    rec_text = ""
-    kb = after_guide_keyboard(user_id)
-    if rec_guide:
-        rec_title = rec_guide.get("title", "")
-        rec_id = rec_guide.get("id", "")
-        rec_text = f"\n\n💡 Для вашей сферы рекомендуем:\n📚 <b>{_esc_html(rec_title)}</b>"
-        dl_data = f"guide_{rec_id}"
-        while len(dl_data.encode("utf-8")) > 64:
-            dl_data = dl_data[:-1]
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"📥 {rec_title}"[:55], callback_data=dl_data)],
-            [InlineKeyboardButton(text="🔹 Все темы", callback_data="show_categories")],
-            [InlineKeyboardButton(text="🔹 Консультация", callback_data="book_consultation")],
-        ])
-
     await message.answer(
         f"Спасибо! Запомнили: <b>{_esc_html(sphere)}</b>. "
-        f"Буду подбирать материалы для вашей сферы.{rec_text}",
-        reply_markup=kb,
+        "Буду подбирать материалы для вашей сферы.",
     )
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    wn_text, wn_kb = await _build_whats_next(
+        user_id, last_guide, catalog, cache, google,
+        header="📚 <b>Что ещё может быть полезно?</b>",
+    )
+    await message.answer(wn_text, reply_markup=wn_kb)
     await state.clear()
 
 
@@ -910,6 +919,7 @@ async def process_profile_button(
     callback: CallbackQuery,
     state: FSMContext,
     google: GoogleSheetsClient,
+    cache: TTLCache,
 ) -> None:
     """Обработка выбора варианта в профильном вопросе."""
     from src.database.crud import update_user_profile
@@ -918,6 +928,7 @@ async def process_profile_button(
     data = await state.get_data()
     user_id = data.get("profiling_user_id", callback.from_user.id)
     field = data.get("profiling_field", "")
+    last_guide = data.get("selected_guide", "")
 
     # Разбираем callback: profile_{field}_{value}
     # field может содержать '_', поэтому берём из FSM data
@@ -941,7 +952,12 @@ async def process_profile_button(
         await callback.message.edit_text(
             "Хорошо, пропускаем. Вы всегда сможете уточнить позже.",
         )
-        await callback.message.answer("📚 Что дальше?", reply_markup=after_guide_keyboard(user_id))
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        wn_text, wn_kb = await _build_whats_next(
+            user_id, last_guide, catalog, cache, google,
+            header="📚 <b>Что ещё может быть полезно?</b>",
+        )
+        await callback.message.answer(wn_text, reply_markup=wn_kb)
         await state.clear()
         return
 
@@ -956,7 +972,12 @@ async def process_profile_button(
     await callback.message.edit_text(
         f"Отлично, запомнили! Спасибо.",
     )
-    await callback.message.answer("📚 Что дальше?", reply_markup=after_guide_keyboard(user_id))
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    wn_text, wn_kb = await _build_whats_next(
+        user_id, last_guide, catalog, cache, google,
+        header="📚 <b>Что ещё может быть полезно?</b>",
+    )
+    await callback.message.answer(wn_text, reply_markup=wn_kb)
     await state.clear()
 
 
@@ -965,6 +986,7 @@ async def process_profile_text(
     message: Message,
     state: FSMContext,
     google: GoogleSheetsClient,
+    cache: TTLCache,
 ) -> None:
     """Текстовый ввод для профильного вопроса."""
     from src.database.crud import update_user_profile
@@ -977,12 +999,18 @@ async def process_profile_text(
     data = await state.get_data()
     user_id = data.get("profiling_user_id", message.from_user.id)
     field = data.get("profiling_field", "")
+    last_guide = data.get("selected_guide", "")
 
     if text == "-" or len(text) < 2:
         await message.answer(
             "Хорошо, пропускаем. Вы всегда сможете уточнить позже.",
-            reply_markup=after_guide_keyboard(user_id),
         )
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        wn_text, wn_kb = await _build_whats_next(
+            user_id, last_guide, catalog, cache, google,
+            header="📚 <b>Что ещё может быть полезно?</b>",
+        )
+        await message.answer(wn_text, reply_markup=wn_kb)
         await state.clear()
         return
 
@@ -995,8 +1023,13 @@ async def process_profile_text(
 
     await message.answer(
         f"Спасибо! Запомнили: <b>{_esc_html(value)}</b>.",
-        reply_markup=after_guide_keyboard(user_id),
     )
+    catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+    wn_text, wn_kb = await _build_whats_next(
+        user_id, last_guide, catalog, cache, google,
+        header="📚 <b>Что ещё может быть полезно?</b>",
+    )
+    await message.answer(wn_text, reply_markup=wn_kb)
     await state.clear()
 
 
@@ -1169,49 +1202,119 @@ async def process_consent(
     )
     await callback.message.answer("⚙️", reply_markup=main_menu_keyboard())
 
-    # 5a. Если есть pending_guide — автоматически выдаём гайд
+    # 5a. Если есть pending_guide — сразу доставляем PDF + рекомендации
     pending_guide = data.get("pending_guide")
     if pending_guide:
         catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
         pg_info = _find_guide(catalog, pending_guide)
         if pg_info:
             pg_id = pg_info.get("id", pending_guide)
-            dl_data = f"download_{pg_id}"
-            while len(dl_data.encode("utf-8")) > 64:
-                dl_data = dl_data[:-1]
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=f"📥 Получить: {pg_info['title']}",
-                    callback_data=dl_data,
-                )],
-                [InlineKeyboardButton(
-                    text="🔹 Все темы", callback_data="show_categories",
-                )],
-            ])
-            await callback.message.answer(
-                f"📚 <b>{pg_info['title']}</b>\n\n"
-                f"{pg_info.get('description', '')}\n\n"
-                "Нажмите кнопку ниже, чтобы получить гайд:",
-                reply_markup=kb,
+            guide_title = pg_info.get("title", pg_id)
+            guide_desc = pg_info.get("description", "")
+
+            # Доставляем PDF сразу, без лишнего клика
+            file_id = pg_info.get("drive_file_id", "")
+            local_path = None
+            telegram_file_id = None
+
+            if file_id.startswith("local:"):
+                local_guide_id = file_id.removeprefix("local:")
+                local_candidate = os.path.join("data", "guides", f"{local_guide_id}.pdf")
+                if os.path.isfile(local_candidate):
+                    local_path = local_candidate
+                else:
+                    mapping_path = os.path.join("data", "guides", "telegram_files.json")
+                    if os.path.isfile(mapping_path):
+                        import json as _json
+                        with open(mapping_path, "r", encoding="utf-8") as f:
+                            mapping = _json.load(f)
+                        entry = mapping.get(local_guide_id, {})
+                        telegram_file_id = entry.get("file_id")
+            elif file_id:
+                local_path = await download_guide_pdf(file_id)
+
+            caption = (
+                f"📚 <b>{_esc_html(guide_title)}</b>\n\n"
+                f"{_esc_html(guide_desc)}\n\n"
+                "Сохраните файл — он пригодится при принятии решений."
             )
+            if len(caption) > 1024:
+                caption = caption[:1020] + "..."
+
+            pdf_sent = False
+            if telegram_file_id:
+                await callback.message.answer_document(
+                    document=telegram_file_id, caption=caption,
+                )
+                pdf_sent = True
+            elif local_path:
+                document = FSInputFile(local_path)
+                await callback.message.answer_document(
+                    document=document, caption=caption,
+                )
+                pdf_sent = True
+
+            if pdf_sent:
+                metrics.inc("pdf_delivered")
+                asyncio.create_task(track(
+                    user_id, "pdf_delivered",
+                    guide_id=pg_id, source=traffic_source or None,
+                ))
+                asyncio.create_task(schedule_followup_series(user_id, pg_id))
+
+                # Retargeting
+                try:
+                    from src.bot.utils.retargeting import track_download_event
+                    asyncio.create_task(track_download_event(user_id, email, pg_id))
+                except Exception:
+                    pass
+
+                # Google Sheets: дублируем скачивание
+                asyncio.create_task(
+                    google.append_lead(
+                        user_id=user_id, username=username,
+                        name=name, email=email, guide=pg_id,
+                        source=traffic_source,
+                    )
+                )
+
+                # Рекомендации + кейс + консультация
+                wn_text, wn_kb = await _build_whats_next(
+                    user_id, pg_id, catalog, cache, google,
+                )
+                await callback.message.answer(wn_text, reply_markup=wn_kb)
+            else:
+                # PDF недоступен — показываем кнопку retry
+                dl_data = f"download_{pg_id}"
+                while len(dl_data.encode("utf-8")) > 64:
+                    dl_data = dl_data[:-1]
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text=f"📥 Получить: {guide_title}",
+                        callback_data=dl_data,
+                    )],
+                    [InlineKeyboardButton(
+                        text="🔹 Все темы", callback_data="show_categories",
+                    )],
+                ])
+                await callback.message.answer(
+                    f"📚 <b>{guide_title}</b>\n\n"
+                    "Нажмите кнопку ниже, чтобы получить гайд:",
+                    reply_markup=kb,
+                )
         else:
-            await callback.message.answer(
-                "📚 Хотите посмотреть другие полезные материалы?",
-                reply_markup=after_guide_keyboard(user_id),
-            )
-    else:
-        # Если пользователь прошёл регистрацию без выбора гайда — показываем каталог
-        if not selected_guide:
             catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
             await callback.message.answer(
-                "🎉 <b>Отлично!</b> Теперь выберите тему, которая вам интересна:",
+                "📚 Хотите посмотреть другие полезные материалы?",
                 reply_markup=categories_keyboard(catalog),
             )
-        else:
-            await callback.message.answer(
-                "📚 Хотите посмотреть другие полезные материалы?",
-                reply_markup=after_guide_keyboard(user_id),
-            )
+    else:
+        # Нет pending_guide — показываем каталог
+        catalog = await cache.get_or_fetch("catalog", google.get_guides_catalog)
+        await callback.message.answer(
+            "🎉 <b>Отлично!</b> Теперь выберите тему, которая вам интересна:",
+            reply_markup=categories_keyboard(catalog),
+        )
 
     # 6. Уведомляем админа
     asyncio.create_task(
